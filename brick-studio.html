@@ -1,0 +1,2606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Brick Studio</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #f1f2f4; overflow: hidden; font-family: system-ui, -apple-system, sans-serif; }
+  #info { position: absolute; top: 0; left: 0; right: 0; padding: 22px; text-align: center; color: #2a2f36; pointer-events: none; }
+  #info h1 { margin: 0 0 4px; font-size: 32px; letter-spacing: 3px; }
+  #info .by { color: #7a8290; font-size: 15px; }
+  #info .tip { margin-top: 10px; font-size: 15px; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="info">
+  <h1>THE BRICK STUDIO</h1>
+  <div class="by">made by Noah Young.</div>
+  <div class="tip">Open this page in the Quest browser and press ENTER VR</div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+/* =========================================================
+   CONSTANTS
+   Grid: x/z in studs (P meters), y in plates (PH meters).
+   A brick is 3 plates tall. A 2x4 brick is about hand sized.
+   ========================================================= */
+const P = 0.04, PH = 0.016, GAP = 0.0005, HALF = Math.PI / 2;
+const SMALL = 0.085;            // shrink scale: you become ~3 bricks tall
+const BGC = 0xf1f2f4;
+const PALETTE = [0xf4f4f4, 0xa3a8ad, 0x5b6066, 0x1f2124, 0xd0201a, 0xfe8a18, 0xf8d22a, 0xe4cd9e,
+                 0x7b4a2a, 0xa5ca18, 0x2aa148, 0x1a5c3a, 0x5fb8e8, 0x1e5aa8, 0x7d43a6, 0xff8ec6];
+const UP = new THREE.Vector3(0, 1, 0);
+const WHITE = new THREE.Color(0xffffff);
+const _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3(), _v3 = new THREE.Vector3(), _v4 = new THREE.Vector3();
+const _q = new THREE.Quaternion(), _m = new THREE.Matrix4(), _m2 = new THREE.Matrix4(), _m3 = new THREE.Matrix4(), _m4 = new THREE.Matrix4();
+const _c = new THREE.Color();
+const _key = (x, y, z) => x + ',' + y + ',' + z;
+
+/* ---------- global state ---------- */
+let curColor = 4;
+let mode = 'big';           // 'big' builder or 'small' explorer
+let trans = null;           // shrink / grow animation
+let worldVer = 0;
+let saveTimer = 0;
+let slot = 1;
+let tmpId = -1;
+let turnLatch = false;
+let glueMode = false, glueDirty = false;
+const NB6 = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+const thrown = [];
+const animDoors = new Set();
+const undoStack = [], redoStack = [];
+
+/* =========================================================
+   RENDERER / SCENE
+   ========================================================= */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+renderer.xr.setFoveation(0.6);
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(BGC);
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.35;
+
+const MAT = {
+  plastic: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.3, metalness: 0 }),
+  glass: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.06, metalness: 0, transparent: true, opacity: 0.42, depthWrite: false }),
+  glow: new THREE.MeshStandardMaterial({ color: 0xfff3c4, emissive: 0xffe8a0, emissiveIntensity: 1.3, roughness: 0.4 }),
+  lit: new THREE.MeshBasicMaterial({ color: 0xffffff }),
+};
+
+function tintColor(hex, tint, out) {
+  if (typeof tint === 'number') return out.set(tint);
+  out.set(hex);
+  if (tint === 'dark') out.multiplyScalar(0.62);
+  else if (tint === 'glass') out.lerp(WHITE, 0.35);
+  else if (tint === 'light') out.lerp(WHITE, 0.45);
+  return out;
+}
+
+/* =========================================================
+   GEOMETRY HELPERS
+   ========================================================= */
+function N(g) {
+  if (g.index) g = g.toNonIndexed();
+  for (const k of Object.keys(g.attributes)) if (!['position', 'normal', 'uv'].includes(k)) g.deleteAttribute(k);
+  if (!g.attributes.normal) g.computeVertexNormals();
+  if (!g.attributes.uv) g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(g.attributes.position.count * 2), 2));
+  return g;
+}
+function merge(list) {
+  const g = mergeGeometries(list.map(N), false);
+  if (list.some(x => x.userData.stud)) { const ns = list.filter(x => !x.userData.stud); g.userData.noStud = ns.length ? mergeGeometries(ns.map(N), false) : null; }
+  return g;
+}
+function rbox(x0, y0, z0, x1, y1, z1, rad = 0.0018) {
+  const w = x1 - x0, h = y1 - y0, d = z1 - z0;
+  const r = Math.min(rad, w / 2.2, h / 2.2, d / 2.2);
+  const g = new RoundedBoxGeometry(w, h, d, 2, r);
+  g.translate((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
+  return g;
+}
+// box in cell units (studs x/z, plates y) with the seam gap
+function cellBox(cx0, cy0, cz0, cx1, cy1, cz1) {
+  return rbox(cx0 * P + GAP, cy0 * PH, cz0 * P + GAP, cx1 * P - GAP, cy1 * PH - GAP * 0.6, cz1 * P - GAP);
+}
+const STUD_R = 0.3 * P, STUD_H = 0.0075;
+const STUD = (() => {
+  const c = new THREE.CylinderGeometry(STUD_R, STUD_R, STUD_H, 10, 1, true); c.translate(0, STUD_H / 2, 0);
+  const t = new THREE.CircleGeometry(STUD_R, 10); t.rotateX(-Math.PI / 2); t.translate(0, STUD_H, 0);
+  return merge([c, t]);
+})();
+function studsAt(list) {
+  return list.map(([cx, cz, ty]) => { const g = STUD.clone(); g.translate((cx + 0.5) * P, ty * PH - GAP * 0.6, (cz + 0.5) * P); g.userData.stud = true; return g; });
+}
+const allStuds = (w, d, h) => { const a = []; for (let x = 0; x < w; x++) for (let z = 0; z < d; z++) a.push([x, z, h]); return a; };
+const backStuds = (w, h) => { const a = []; for (let x = 0; x < w; x++) a.push([x, 0, h]); return a; };
+function cyl(rt, rb, h, seg, cx, cz, y0) { const g = new THREE.CylinderGeometry(rt, rb, h, seg); g.translate(cx, y0 + h / 2, cz); return g; }
+// profile [z,y] (stud/plate units) extruded along x for w studs
+function extrudeX(pts, w, d, h) {
+  const s = new THREE.Shape();
+  pts.forEach(([z, y], i) => {
+    const zz = Math.min(Math.max(z * P, GAP), d * P - GAP), yy = Math.min(y * PH, h * PH - GAP * 0.6);
+    if (i) s.lineTo(-zz, yy); else s.moveTo(-zz, yy);
+  });
+  const g = new THREE.ExtrudeGeometry(s, { depth: w * P - 2 * GAP, bevelEnabled: false, curveSegments: 4 });
+  g.rotateY(Math.PI / 2); g.translate(GAP, 0, 0);
+  return g;
+}
+
+/* =========================================================
+   PIECE TYPES
+   cells: occupied grid cells. studs: [x, z, topPlate].
+   parts: separately-colored meshes (tint 'self' = chosen color).
+   ========================================================= */
+const TYPES = [], T = {};
+function def(o) {
+  if (!o.cells) { o.cells = []; for (let x = 0; x < o.w; x++) for (let y = 0; y < o.h; y++) for (let z = 0; z < o.d; z++) o.cells.push([x, y, z]); }
+  o.studs = o.studs || [];
+  const own = new Set(o.cells.map(c => _key(c[0], c[1], c[2])));
+  const studTop = new Set(o.studs.map(s => _key(s[0], s[2] - 1, s[1])));
+  const openSet = o.openCells ? new Set(o.openCells.map(c => _key(c[0], c[1], c[2]))) : null;
+  const info = o.cells.map(([x, y, z]) => ({ x, y, z, top: studTop.has(_key(x, y, z)), bot: !own.has(_key(x, y - 1, z)), open: !!(openSet && openSet.has(_key(x, y, z))) }));
+  o.rc = [0, 1, 2, 3].map(r => info.map(c => {
+    let x = c.x, z = c.z;
+    for (let i = 0; i < r; i++) { const nx = z, nz = -x - 1; x = nx; z = nz; }
+    return { x, y: c.y, z, top: c.top, bot: c.bot, open: c.open };
+  }));
+  o.bb = o.rc.map(cs => {
+    const b = { x0: 1e9, y0: 1e9, z0: 1e9, x1: -1e9, y1: -1e9, z1: -1e9 };
+    for (const c of cs) { b.x0 = Math.min(b.x0, c.x); b.y0 = Math.min(b.y0, c.y); b.z0 = Math.min(b.z0, c.z); b.x1 = Math.max(b.x1, c.x + 1); b.y1 = Math.max(b.y1, c.y + 1); b.z1 = Math.max(b.z1, c.z + 1); }
+    return b;
+  });
+  o.idx = TYPES.length; TYPES.push(o); T[o.id] = o;
+  return o;
+}
+function boxPiece(id, name, cat, w, d, h, opt = {}) {
+  const studs = opt.studs === false ? [] : allStuds(w, d, h);
+  const g = merge([cellBox(0, 0, 0, w, h, d), ...studsAt(studs)]);
+  return def({ id, name, cat, w, d, h, studs, parts: [{ g, tint: opt.tint || 'self', mat: opt.mat || 'plastic' }] });
+}
+function slopePiece(id, name, w, d, h, pts, studs) {
+  return def({ id, name, cat: 'slopes', w, d, h, studs, parts: [{ g: merge([extrudeX(pts, w, d, h), ...studsAt(studs)]), tint: 'self', mat: 'plastic' }] });
+}
+
+// ---- Bricks
+[[1, 1], [1, 2], [1, 3], [1, 4], [1, 6], [1, 8], [2, 2], [2, 3], [2, 4], [2, 6], [2, 8], [4, 4]]
+  .forEach(([a, b]) => boxPiece(`b${a}x${b}`, `Brick ${a}x${b}`, 'bricks', b, a, 3));
+boxPiece('tb1x2', 'Tall 1x2', 'bricks', 2, 1, 6);
+boxPiece('tb2x2', 'Tall 2x2', 'bricks', 2, 2, 6);
+
+// ---- Plates and tiles
+[[1, 1], [1, 2], [1, 4], [2, 2], [2, 4], [4, 4], [4, 8], [8, 8], [16, 16]]
+  .forEach(([a, b]) => boxPiece(`p${a}x${b}`, `Plate ${a}x${b}`, 'plates', b, a, 1));
+[[1, 1], [1, 2], [2, 2], [2, 4], [4, 4], [8, 8]]
+  .forEach(([a, b]) => boxPiece(`t${a}x${b}`, `Tile ${a}x${b}`, 'plates', b, a, 1, { studs: false }));
+
+// ---- Slopes and curves
+const SLOPE45 = [[0, 0], [2, 0], [2, 1], [1, 3], [0, 3]];
+slopePiece('s1x2', 'Slope 1x2', 1, 2, 3, SLOPE45, backStuds(1, 3));
+slopePiece('s2x2', 'Slope 2x2', 2, 2, 3, SLOPE45, backStuds(2, 3));
+slopePiece('s4x2', 'Slope 4x2', 4, 2, 3, SLOPE45, backStuds(4, 3));
+slopePiece('s2x3', 'Long Slope', 2, 3, 3, [[0, 0], [3, 0], [3, 1], [1, 3], [0, 3]], backStuds(2, 3));
+const INV = [[0, 0], [1, 0], [2, 2], [2, 3], [0, 3]];
+slopePiece('i1x2', 'Inv Slope 1x2', 1, 2, 3, INV, allStuds(1, 2, 3));
+slopePiece('i2x2', 'Inv Slope 2x2', 2, 2, 3, INV, allStuds(2, 2, 3));
+const curvePts = d => { const a = [[0, 0], [d, 0], [d, 1]]; for (let i = 1; i < 12; i++) { const t = HALF * (1 - i / 12); a.push([d * Math.sin(t), 1 + 2 * Math.cos(t)]); } a.push([0, 3]); return a; };
+slopePiece('c2x2', 'Curve 2x2', 2, 2, 3, curvePts(2), []);
+slopePiece('c1x4', 'Curve 1x4', 1, 4, 3, curvePts(4), []);
+const RIDGE = [[0, 0], [2, 0], [2, 1], [1, 3], [0, 1]];
+slopePiece('r2x2', 'Roof Peak 2x2', 2, 2, 3, RIDGE, []);
+slopePiece('r4x2', 'Roof Peak 4x2', 4, 2, 3, RIDGE, []);
+(() => { // Arch 1x4
+  const s = new THREE.Shape(), top = 3 * PH - GAP * 0.6;
+  s.moveTo(GAP, 0); s.lineTo(P, 0);
+  for (let i = 1; i < 16; i++) { const a = Math.PI - Math.PI * i / 16; s.lineTo(2 * P + P * Math.cos(a), 2 * PH * Math.sin(a)); }
+  s.lineTo(3 * P, 0); s.lineTo(4 * P - GAP, 0); s.lineTo(4 * P - GAP, top); s.lineTo(GAP, top);
+  const g = new THREE.ExtrudeGeometry(s, { depth: P - 2 * GAP, bevelEnabled: false }); g.translate(0, 0, GAP);
+  const cells = []; for (const x of [0, 3]) for (let y = 0; y < 3; y++) cells.push([x, y, 0]); cells.push([1, 2, 0], [2, 2, 0]);
+  const studs = allStuds(4, 1, 3);
+  def({ id: 'arch', name: 'Arch 1x4', cat: 'slopes', w: 4, d: 1, h: 3, cells, studs, parts: [{ g: merge([g, ...studsAt(studs)]), tint: 'self', mat: 'plastic' }] });
+})();
+def({ id: 'rnd1', name: 'Round 1x1', cat: 'slopes', w: 1, d: 1, h: 3, studs: [[0, 0, 3]],
+  parts: [{ g: merge([cyl(0.47 * P, 0.47 * P, 3 * PH - GAP * 0.6, 16, 0.5 * P, 0.5 * P, 0), ...studsAt([[0, 0, 3]])]), tint: 'self', mat: 'plastic' }] });
+def({ id: 'rnd2', name: 'Round 2x2', cat: 'slopes', w: 2, d: 2, h: 3, studs: allStuds(2, 2, 3),
+  parts: [{ g: merge([cyl(0.97 * P, 0.97 * P, 3 * PH - GAP * 0.6, 24, P, P, 0), ...studsAt(allStuds(2, 2, 3))]), tint: 'self', mat: 'plastic' }] });
+(() => {
+  const sp = new THREE.SphereGeometry(0.97 * P, 20, 8, 0, Math.PI * 2, 0, HALF);
+  sp.scale(1, (2 * PH - GAP) / (0.97 * P), 1); sp.translate(P, PH, P);
+  def({ id: 'dome', name: 'Dome 2x2', cat: 'slopes', w: 2, d: 2, h: 3, studs: [],
+    parts: [{ g: merge([cyl(0.97 * P, 0.97 * P, PH, 24, P, P, 0), sp]), tint: 'self', mat: 'plastic' }] });
+})();
+def({ id: 'cone', name: 'Cone 1x1', cat: 'slopes', w: 1, d: 1, h: 3, studs: [[0, 0, 3]],
+  parts: [{ g: merge([cyl(0.3 * P, 0.47 * P, 3 * PH - GAP * 0.6, 16, 0.5 * P, 0.5 * P, 0), ...studsAt([[0, 0, 3]])]), tint: 'self', mat: 'plastic' }] });
+
+// ---- House
+(() => { // Door 1x4x5 with opening panel
+  const h = 15, studs = allStuds(4, 1, h);
+  const frame = [cellBox(0, 0, 0, 1, h, 1), cellBox(3, 0, 0, 4, h, 1), cellBox(1, 12, 0, 3, h, 1), ...studsAt(studs)];
+  const panel = rbox(P + 0.0015, 0.0005, 0.33 * P, 3 * P - 0.0015, 12 * PH - 0.0015, 0.67 * P, 0.002);
+  const k1 = new THREE.SphereGeometry(0.11 * P, 10, 8); k1.translate(2.65 * P, 6 * PH, 0.67 * P + 0.003);
+  const k2 = k1.clone(); k2.translate(0, 0, -(0.34 * P + 0.006));
+  const openCells = []; for (const x of [1, 2]) for (let y = 0; y < 12; y++) openCells.push([x, y, 0]);
+  def({ id: 'door', name: 'Door', cat: 'house', w: 4, d: 1, h, studs, openCells, door: true,
+    parts: [{ g: merge(frame), tint: 'self', mat: 'plastic' },
+            { g: merge([panel, k1, k2]), tint: 'dark', mat: 'plastic', door: true, hinge: [P, 0, 0.5 * P], axis: 'y', openA: 1.45 }] });
+})();
+function windowPiece(id, name, w, h) {
+  const t = 0.22 * P, studs = allStuds(w, 1, h);
+  const fr = [cellBox(0, 0, 0, w, 1, 1), cellBox(0, h - 1, 0, w, h, 1),
+    rbox(GAP, PH, GAP, t, (h - 1) * PH, P - GAP), rbox(w * P - t, PH, GAP, w * P - GAP, (h - 1) * PH, P - GAP)];
+  if (w >= 4) fr.push(rbox(w * P / 2 - 0.1 * P, PH, 0.3 * P, w * P / 2 + 0.1 * P, (h - 1) * PH, 0.7 * P));
+  fr.push(...studsAt(studs));
+  const gl = rbox(t, PH, 0.44 * P, w * P - t, (h - 1) * PH, 0.56 * P, 0.001);
+  return def({ id, name, cat: 'house', w, d: 1, h, studs, parts: [{ g: merge(fr), tint: 'self', mat: 'plastic' }, { g: N(gl), tint: 0xcfeaff, mat: 'glass' }] });
+}
+windowPiece('winS', 'Window S', 2, 6);
+windowPiece('winL', 'Window L', 4, 9);
+boxPiece('gwall', 'Glass Wall', 'house', 4, 1, 9, { mat: 'glass', tint: 'glass' });
+[[1, 1], [1, 2], [1, 4], [2, 2], [2, 4]].forEach(([a, b]) => boxPiece(`g${a}x${b}`, `Glass ${a}x${b}`, 'house', b, a, 3, { mat: 'glass', tint: 'glass' }));
+function stairs(id, name, w) {
+  const geos = [], cells = [];
+  for (let k = 0; k < 4; k++) {
+    const hk = (k + 1) * 3; geos.push(cellBox(0, 0, k, w, hk, k + 1));
+    for (let x = 0; x < w; x++) for (let y = 0; y < hk; y++) cells.push([x, y, k]);
+  }
+  const st = []; for (let x = 0; x < w; x++) st.push([x, 3, 12]);
+  geos.push(...studsAt(st));
+  return def({ id, name, cat: 'house', w, d: 4, h: 12, cells, studs: st, parts: [{ g: merge(geos), tint: 'self', mat: 'plastic' }] });
+}
+stairs('st2', 'Stairs', 2);
+stairs('st4', 'Wide Stairs', 4);
+(() => {
+  const geos = [cellBox(0, 0, 0, 4, 1, 1)];
+  for (let i = 0; i < 8; i++) { const cx = (i + 0.5) * P / 2; geos.push(rbox(cx - 0.07 * P, PH, 0.4 * P, cx + 0.07 * P, 2.95 * PH, 0.6 * P, 0.001)); }
+  geos.push(rbox(GAP, 1.8 * PH, 0.36 * P, 4 * P - GAP, 2.2 * PH, 0.64 * P, 0.001));
+  def({ id: 'fence', name: 'Fence', cat: 'house', w: 4, d: 1, h: 3, studs: [], parts: [{ g: merge(geos), tint: 'self', mat: 'plastic' }] });
+})();
+
+// ---- Fun
+(() => { // googly eye 1x1
+  const studs = [[0, 0, 3]];
+  const w = new THREE.SphereGeometry(0.42 * P, 18, 12); w.scale(1, 1, 0.5); w.translate(0.5 * P, 1.5 * PH, P);
+  const p = new THREE.SphereGeometry(0.2 * P, 14, 10); p.scale(1, 1, 0.5); p.translate(0.5 * P, 1.25 * PH, P + 0.42 * P * 0.5 - 0.0012);
+  def({ id: 'eye', name: 'Eye', cat: 'fun', w: 1, d: 1, h: 3, studs,
+    parts: [{ g: merge([cellBox(0, 0, 0, 1, 3, 1), ...studsAt(studs)]), tint: 'self', mat: 'plastic' },
+            { g: N(w), tint: 0xffffff, mat: 'plastic' }, { g: N(p), tint: 0x111214, mat: 'plastic' }] });
+})();
+(() => { // big googly eye
+  const studs = allStuds(2, 1, 6);
+  const w = new THREE.SphereGeometry(0.88 * P, 24, 16); w.scale(1, 1, 0.5); w.translate(P, 3 * PH, P);
+  const p = new THREE.SphereGeometry(0.42 * P, 18, 12); p.scale(1, 1, 0.5); p.translate(P, 2.6 * PH, P + 0.88 * P * 0.5 - 0.0025);
+  def({ id: 'bigeye', name: 'Big Eye', cat: 'fun', w: 2, d: 1, h: 6, studs,
+    parts: [{ g: merge([cellBox(0, 0, 0, 2, 6, 1), ...studsAt(studs)]), tint: 'self', mat: 'plastic' },
+            { g: N(w), tint: 0xffffff, mat: 'plastic' }, { g: N(p), tint: 0x111214, mat: 'plastic' }] });
+})();
+(() => { // flower
+  const green = merge([cyl(0.45 * P, 0.45 * P, PH, 14, 0.5 * P, 0.5 * P, 0), cyl(0.06 * P, 0.06 * P, 1.6 * PH, 6, 0.5 * P, 0.5 * P, PH)]);
+  const petals = []; for (let i = 0; i < 5; i++) { const a = i * Math.PI * 2 / 5; const s = new THREE.SphereGeometry(0.17 * P, 10, 8); s.translate(0.5 * P + 0.2 * P * Math.cos(a), 2.6 * PH, 0.5 * P + 0.2 * P * Math.sin(a)); petals.push(s); }
+  const ctr = new THREE.SphereGeometry(0.12 * P, 10, 8); ctr.translate(0.5 * P, 2.72 * PH, 0.5 * P);
+  def({ id: 'flower', name: 'Flower', cat: 'fun', w: 1, d: 1, h: 3, studs: [],
+    parts: [{ g: green, tint: 0x3f9b3f, mat: 'plastic' }, { g: merge(petals), tint: 'self', mat: 'plastic' }, { g: N(ctr), tint: 0xffd23a, mat: 'plastic' }] });
+})();
+(() => { // tree
+  const trunk = cyl(0.26 * P, 0.3 * P, 4.5 * PH, 10, P, P, 0);
+  const c1 = new THREE.CylinderGeometry(0, 0.98 * P, 5.5 * PH, 16); c1.translate(P, 3.5 * PH + 2.75 * PH, P);
+  const c2 = new THREE.CylinderGeometry(0, 0.75 * P, 4.5 * PH, 16); c2.translate(P, 7 * PH + 2.25 * PH, P);
+  def({ id: 'tree', name: 'Tree', cat: 'fun', w: 2, d: 2, h: 12, studs: [],
+    parts: [{ g: N(trunk), tint: 0x7a4a26, mat: 'plastic' }, { g: merge([c1, c2]), tint: 'self', mat: 'plastic' }] });
+})();
+(() => { // wheels
+  const studs = allStuds(2, 2, 4);
+  const body = merge([cellBox(0, 3, 0, 2, 4, 2), ...studsAt(studs)]);
+  const axle = rbox(0.15 * P, 1.5 * PH, 0.75 * P, 1.85 * P, 3 * PH, 1.25 * P);
+  const tires = [], rims = [];
+  for (const xs of [-0.18 * P, 2.18 * P]) {
+    const t = new THREE.CylinderGeometry(2 * PH, 2 * PH, 0.4 * P, 22); t.rotateZ(HALF); t.translate(xs, 2 * PH, P); tires.push(t);
+    const r = new THREE.CylinderGeometry(0.42 * P, 0.42 * P, 0.44 * P, 14); r.rotateZ(HALF); r.translate(xs, 2 * PH, P); rims.push(r);
+  }
+  def({ id: 'wheels', name: 'Wheels', cat: 'fun', w: 2, d: 2, h: 4, studs,
+    parts: [{ g: body, tint: 'self', mat: 'plastic' }, { g: N(axle), tint: 0x55595e, mat: 'plastic' },
+            { g: merge(tires), tint: 0x222428, mat: 'plastic' }, { g: merge(rims), tint: 0xd9dde1, mat: 'plastic' }] });
+})();
+(() => { // street lamp
+  const cap = new THREE.CylinderGeometry(0.05 * P, 0.42 * P, 0.6 * PH, 12); cap.translate(0.5 * P, 17.5 * PH, 0.5 * P);
+  const pole = merge([cyl(0.45 * P, 0.45 * P, PH, 14, 0.5 * P, 0.5 * P, 0), cyl(0.12 * P, 0.12 * P, 15.5 * PH, 8, 0.5 * P, 0.5 * P, PH), cap]);
+  const head = new THREE.SphereGeometry(0.36 * P, 14, 10); head.translate(0.5 * P, 16.8 * PH, 0.5 * P);
+  def({ id: 'lamp', name: 'Lamp', cat: 'fun', w: 1, d: 1, h: 18, studs: [],
+    parts: [{ g: pole, tint: 'self', mat: 'plastic' }, { g: N(head), tint: 0xfff3c4, mat: 'glow' }] });
+})();
+
+/* =========================================================
+   MORE PIECES: Shapes, Home, Nature, City
+   ========================================================= */
+function inPoly(x, z, pts) {
+  let c = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const [xi, zi] = pts[i], [xj, zj] = pts[j];
+    if ((zi > z) !== (zj > z) && x < (xj - xi) * (z - zi) / (zj - zi) + xi) c = !c;
+  }
+  return c;
+}
+// polygon [x,z] (studs) extruded upward from plate y0 to y1
+function extrudeY(pts, y0, y1) {
+  const s = new THREE.Shape();
+  pts.forEach(([x, z], i) => { if (i) s.lineTo(x * P, -z * P); else s.moveTo(x * P, -z * P); });
+  const g = new THREE.ExtrudeGeometry(s, { depth: (y1 - y0) * PH - GAP * 0.6, bevelEnabled: false, curveSegments: 8 });
+  g.rotateX(-HALF); g.translate(0, y0 * PH, 0);
+  return g;
+}
+const fixed = (g, tint, mat = 'plastic', extra = {}) => ({ g: Array.isArray(g) ? merge(g) : N(g), tint, mat, ...extra });
+function piece(id, name, cat, w, d, h, parts, opt = {}) {
+  return def({ id, name, cat, w, d, h, studs: opt.studs || [], cells: opt.cells, openCells: opt.openCells, door: opt.door, parts });
+}
+function sph(r, x, y, z, ws = 14, hs = 10) { const g = new THREE.SphereGeometry(r, ws, hs); g.translate(x, y, z); return g; }
+function flat(g) { g = g.toNonIndexed(); g.computeVertexNormals(); return g; }
+
+// ---- Shapes
+boxPiece('b2x10', 'Brick 2x10', 'shapes', 10, 2, 3);
+boxPiece('b4x6', 'Brick 4x6', 'shapes', 6, 4, 3);
+boxPiece('b6x6', 'Brick 6x6', 'shapes', 6, 6, 3);
+boxPiece('pillar', 'Pillar 1x1', 'shapes', 1, 1, 9);
+function wedge(id, name, pts, w, d, h) {
+  const st = [];
+  for (let x = 0; x < w; x++) for (let z = 0; z < d; z++) if (inPoly(x + 0.5, z + 0.5, pts)) st.push([x, z, h]);
+  return piece(id, name, 'shapes', w, d, h, [fixed([extrudeY(pts, 0, h), ...studsAt(st)], 'self')], { studs: st });
+}
+wedge('wpl', 'Wedge Plate L', [[0, 0], [4, 0], [4, 2]], 4, 2, 1);
+wedge('wpr', 'Wedge Plate R', [[0, 0], [4, 0], [0, 2]], 4, 2, 1);
+wedge('wbl', 'Wedge Brick L', [[0, 0], [4, 0], [4, 2]], 4, 2, 3);
+wedge('wbr', 'Wedge Brick R', [[0, 0], [4, 0], [0, 2]], 4, 2, 3);
+function lpiece(id, name, rects, h) {
+  const cells = [], st = [], geos = []; let w = 0, d = 0;
+  for (const [x0, z0, x1, z1] of rects) {
+    geos.push(cellBox(x0, 0, z0, x1, h, z1)); w = Math.max(w, x1); d = Math.max(d, z1);
+    for (let x = x0; x < x1; x++) for (let z = z0; z < z1; z++) { st.push([x, z, h]); for (let y = 0; y < h; y++) cells.push([x, y, z]); }
+  }
+  geos.push(...studsAt(st));
+  return piece(id, name, 'shapes', w, d, h, [fixed(geos, 'self')], { cells, studs: st });
+}
+lpiece('cb2', 'Corner Brick', [[0, 0, 2, 1], [0, 1, 1, 2]], 3);
+lpiece('cp2', 'Corner Plate', [[0, 0, 2, 1], [0, 1, 1, 2]], 1);
+lpiece('cp4', 'Big Corner 4x4', [[0, 0, 4, 2], [0, 2, 2, 4]], 1);
+piece('cyl2', 'Tall Round 2x2', 'shapes', 2, 2, 9, [fixed([cyl(0.97 * P, 0.97 * P, 9 * PH - GAP * 0.6, 24, P, P, 0), ...studsAt(allStuds(2, 2, 9))], 'self')], { studs: allStuds(2, 2, 9) });
+(() => {
+  const pts = [[0, 0], [2, 0]];
+  for (let i = 1; i < 16; i++) { const a = Math.PI * i / 16; pts.push([1 + Math.cos(a), 3 * Math.sin(a)]); }
+  piece('barrel', 'Half Round 2x4', 'shapes', 4, 2, 3, [fixed(extrudeX(pts, 4, 2, 3), 'self')]);
+})();
+(() => {
+  const pts = [[0, 0]];
+  for (let i = 0; i <= 12; i++) { const a = HALF * i / 12; pts.push([2 * Math.cos(a), 2 * Math.sin(a)]); }
+  const st = [[0, 0, 3], [1, 0, 3], [0, 1, 3]];
+  piece('qround', 'Quarter Round', 'shapes', 2, 2, 3, [fixed([extrudeY(pts, 0, 3), ...studsAt(st)], 'self')], { studs: st });
+})();
+piece('rt1', 'Round Tile 1x1', 'shapes', 1, 1, 1, [fixed(cyl(0.47 * P, 0.47 * P, PH - GAP * 0.6, 16, 0.5 * P, 0.5 * P, 0), 'self')]);
+piece('rt2', 'Round Tile 2x2', 'shapes', 2, 2, 1, [fixed(cyl(0.97 * P, 0.97 * P, PH - GAP * 0.6, 24, P, P, 0), 'self')]);
+piece('ball', 'Ball 2x2', 'shapes', 2, 2, 5, [fixed(sph(0.97 * P, P, 2.5 * PH, P, 22, 16), 'self')]);
+(() => {
+  const g = new THREE.CylinderGeometry(0, 1.36 * P, 6 * PH - GAP, 4, 1); g.rotateY(Math.PI / 4); g.translate(P, 3 * PH, P);
+  piece('pyramid', 'Pyramid 2x2', 'shapes', 2, 2, 6, [fixed(flat(g), 'self')]);
+})();
+
+// ---- Home
+(() => { // chair
+  const g = [];
+  for (const [x, z] of [[0.15, 0.15], [1.55, 0.15], [0.15, 1.55], [1.55, 1.55]]) g.push(rbox(x * P, 0, z * P, (x + 0.3) * P, 3 * PH, (z + 0.3) * P, 0.002));
+  g.push(rbox(GAP, 3 * PH, GAP, 2 * P - GAP, 4 * PH, 2 * P - GAP));
+  g.push(rbox(GAP, 4 * PH, GAP, 2 * P - GAP, 7 * PH - GAP, 0.32 * P));
+  const cells = [];
+  for (let x = 0; x < 2; x++) { for (let z = 0; z < 2; z++) for (let y = 0; y < 4; y++) cells.push([x, y, z]); for (let y = 4; y < 7; y++) cells.push([x, y, 0]); }
+  piece('chair', 'Chair', 'home', 2, 2, 7, [fixed(g, 'self')], { cells, studs: [[0, 1, 4], [1, 1, 4]] });
+})();
+(() => { // table
+  const g = [], cells = [];
+  for (const [x, z] of [[0, 0], [3, 0], [0, 3], [3, 3]]) {
+    g.push(rbox((x + 0.3) * P, 0, (z + 0.3) * P, (x + 0.7) * P, 4 * PH, (z + 0.7) * P, 0.002));
+    for (let y = 0; y < 4; y++) cells.push([x, y, z]);
+  }
+  for (let x = 0; x < 4; x++) for (let z = 0; z < 4; z++) cells.push([x, 4, z]);
+  const st = allStuds(4, 4, 5);
+  g.push(cellBox(0, 4, 0, 4, 5, 4), ...studsAt(st));
+  piece('table', 'Table', 'home', 4, 4, 5, [fixed(g, 'self')], { cells, studs: st });
+})();
+(() => { // bed
+  const frame = [cellBox(0, 0, 0, 4, 2, 6), cellBox(0, 2, 0, 4, 6, 1)];
+  const soft = [rbox(0.2 * P, 2 * PH, 1 * P, 3.8 * P, 3 * PH, 5.85 * P), rbox(0.5 * P, 3 * PH, 1.15 * P, 3.5 * P, 3.9 * PH, 2.2 * P, 0.004)];
+  const blanket = rbox(0.12 * P, 2.5 * PH, 2.5 * P, 3.88 * P, 3.35 * PH, 5.92 * P, 0.003);
+  piece('bed', 'Bed', 'home', 4, 6, 6, [fixed(frame, 'dark'), fixed(soft, 0xf7f7f2), fixed(blanket, 'self')]);
+})();
+(() => { // couch
+  const fr = [cellBox(0, 0, 0, 6, 2, 2), cellBox(0, 2, 0, 6, 5, 1), cellBox(0, 2, 1, 1, 4, 2), cellBox(5, 2, 1, 6, 4, 2)];
+  const cu = [rbox(1 * P + 0.001, 2 * PH, 1 * P, 3 * P - 0.001, 3 * PH, 2 * P - GAP, 0.004), rbox(3 * P + 0.001, 2 * PH, 1 * P, 5 * P - 0.001, 3 * PH, 2 * P - GAP, 0.004)];
+  const cells = [], st = [];
+  for (let x = 0; x < 6; x++) { for (let z = 0; z < 2; z++) for (let y = 0; y < 2; y++) cells.push([x, y, z]); for (let y = 2; y < 5; y++) cells.push([x, y, 0]); }
+  for (const x of [0, 5]) for (let y = 2; y < 4; y++) cells.push([x, y, 1]);
+  for (let x = 1; x < 5; x++) { cells.push([x, 2, 1]); st.push([x, 1, 3]); }
+  piece('couch', 'Couch', 'home', 6, 2, 5, [fixed(fr, 'self'), fixed(cu, 'light')], { cells, studs: st });
+})();
+(() => { // tv
+  const body = [rbox(1.4 * P, 0, 0.25 * P, 2.6 * P, 0.6 * PH, 0.75 * P), rbox(1.9 * P, 0.6 * PH, 0.42 * P, 2.1 * P, 2 * PH, 0.58 * P), rbox(GAP, 2 * PH, 0.32 * P, 4 * P - GAP, 6 * PH - GAP, 0.68 * P)];
+  const screen = rbox(0.18 * P, 2.3 * PH, 0.66 * P, 3.82 * P, 5.7 * PH, 0.71 * P, 0.001);
+  piece('tv', 'TV', 'home', 4, 1, 6, [fixed(body, 'self'), fixed(screen, 0x16212e)]);
+})();
+(() => { // bookshelf
+  const fr = [rbox(GAP, 0, GAP, 0.22 * P, 12 * PH - GAP, 2 * P - GAP), rbox(3.78 * P, 0, GAP, 4 * P - GAP, 12 * PH - GAP, 2 * P - GAP), rbox(GAP, 0, GAP, 4 * P - GAP, 12 * PH - GAP, 0.2 * P)];
+  for (const y of [0, 4, 8]) fr.push(rbox(GAP, y * PH, GAP, 4 * P - GAP, (y + 0.5) * PH, 2 * P - GAP));
+  fr.push(rbox(GAP, 11.4 * PH, GAP, 4 * P - GAP, 12 * PH - GAP, 2 * P - GAP));
+  const books = [[], [], []]; let k = 0;
+  for (const y of [0.5, 4.5, 8.5]) {
+    let x = 0.26;
+    for (;;) {
+      const bw = 0.22 + ((k * 37) % 5) * 0.04, bh = 2.2 + ((k * 13) % 4) * 0.2;
+      if (x + bw > 3.74) break;
+      books[k % 3].push(rbox(x * P, y * PH, 0.3 * P, (x + bw) * P, (y + bh) * PH, 1.7 * P, 0.0012));
+      x += bw + 0.02; k++;
+    }
+  }
+  piece('shelf', 'Bookshelf', 'home', 4, 2, 12, [fixed(fr, 'self'), fixed(books[0], 0xc43b2f), fixed(books[1], 0x2f62b8), fixed(books[2], 0xe0b83a)]);
+})();
+(() => { // fridge
+  const trim = [rbox(GAP, 7.85 * PH, 1.97 * P, 2 * P - GAP, 8.05 * PH, 2.02 * P, 0.0005),
+    rbox(0.25 * P, 3 * PH, 1.98 * P, 0.38 * P, 7 * PH, 2.12 * P, 0.002), rbox(0.25 * P, 8.6 * PH, 1.98 * P, 0.38 * P, 11 * PH, 2.12 * P, 0.002)];
+  piece('fridge', 'Fridge', 'home', 2, 2, 12, [fixed(cellBox(0, 0, 0, 2, 12, 2), 'self'), fixed(trim, 0x9aa1a8)]);
+})();
+(() => { // stove
+  const top = [rbox(GAP, 5 * PH, GAP, 2 * P - GAP, 6 * PH - GAP, 2 * P - GAP), rbox(0.3 * P, 1 * PH, 1.98 * P, 1.7 * P, 3.8 * PH, 2.03 * P, 0.001)];
+  const y = 6 * PH - GAP;
+  const burn = [cyl(0.3 * P, 0.3 * P, 0.25 * PH, 14, 0.55 * P, 0.55 * P, y), cyl(0.3 * P, 0.3 * P, 0.25 * PH, 14, 1.45 * P, 1.45 * P, y),
+    cyl(0.24 * P, 0.24 * P, 0.25 * PH, 14, 1.45 * P, 0.55 * P, y), cyl(0.24 * P, 0.24 * P, 0.25 * PH, 14, 0.55 * P, 1.45 * P, y)];
+  piece('stove', 'Stove', 'home', 2, 2, 6, [fixed(cellBox(0, 0, 0, 2, 5, 2), 'self'), fixed(top, 0x2e3136), fixed(burn, 0x111214)]);
+})();
+(() => { // bathtub
+  const t = 0.25 * P, h = 4 * PH - GAP;
+  const g = [rbox(GAP, 0, GAP, 4 * P - GAP, PH, 2 * P - GAP), rbox(GAP, 0, GAP, 4 * P - GAP, h, t), rbox(GAP, 0, 2 * P - t, 4 * P - GAP, h, 2 * P - GAP),
+    rbox(GAP, 0, GAP, t, h, 2 * P - GAP), rbox(4 * P - t, 0, GAP, 4 * P - GAP, h, 2 * P - GAP)];
+  const water = rbox(t, PH, t, 4 * P - t, 3 * PH, 2 * P - t, 0.001);
+  const tap = [cyl(0.07 * P, 0.07 * P, 1.6 * PH, 8, 0.45 * P, 1 * P, h), rbox(0.42 * P, h + 1.2 * PH, 0.92 * P, 0.9 * P, h + 1.6 * PH, 1.08 * P, 0.001)];
+  piece('tub', 'Bathtub', 'home', 4, 2, 6, [fixed(g, 'self'), fixed(water, 0x9fd8ff, 'glass'), fixed(tap, 0xc9ced3)]);
+})();
+(() => { // table lamp
+  const body = [cyl(0.4 * P, 0.45 * P, 0.5 * PH, 14, 0.5 * P, 0.5 * P, 0), cyl(0.06 * P, 0.06 * P, 3.6 * PH, 8, 0.5 * P, 0.5 * P, 0.5 * PH)];
+  const shade = new THREE.CylinderGeometry(0.2 * P, 0.47 * P, 1.6 * PH, 16, 1, true); shade.translate(0.5 * P, 4.9 * PH, 0.5 * P);
+  piece('dlamp', 'Table Lamp', 'home', 1, 1, 6, [fixed(body, 0x8a9096), fixed(shade, 'self'), fixed(sph(0.16 * P, 0.5 * P, 4.5 * PH, 0.5 * P), 0xfff3c4, 'glow')]);
+})();
+(() => { // rug
+  const base = rbox(GAP, 0, GAP, 6 * P - GAP, 0.45 * PH, 4 * P - GAP, 0.001);
+  const y0 = 0.45 * PH - 0.0004, y1 = 0.5 * PH, i0 = 0.35 * P, i1 = 0.55 * P;
+  const border = [rbox(i0, y0, i0, 6 * P - i0, y1, i1, 0.0004), rbox(i0, y0, 4 * P - i1, 6 * P - i0, y1, 4 * P - i0, 0.0004),
+    rbox(i0, y0, i0, i1, y1, 4 * P - i0, 0.0004), rbox(6 * P - i1, y0, i0, 6 * P - i0, y1, 4 * P - i0, 0.0004)];
+  piece('rug', 'Rug', 'home', 6, 4, 1, [fixed(base, 'self'), fixed(border, 0xf4efe2)]);
+})();
+(() => { // painting
+  const fr = rbox(GAP, 0, 0.3 * P, 4 * P - GAP, 6 * PH - GAP, 0.7 * P);
+  const sky = rbox(0.25 * P, 0.6 * PH, 0.69 * P, 3.75 * P, 5.4 * PH, 0.73 * P, 0.0005);
+  const disc = (r, x, y, half) => { const c = new THREE.CircleGeometry(r, 24, 0, half ? Math.PI : Math.PI * 2); c.translate(x, y, 0.735 * P); return c; };
+  piece('painting', 'Painting', 'home', 4, 1, 6, [fixed(fr, 'self'), fixed(sky, 0x8fd0f0), fixed([disc(1.15 * P, 1.4 * P, 0.6 * PH, true), disc(0.85 * P, 2.9 * P, 0.6 * PH, true)], 0x4caf50), fixed(disc(0.32 * P, 3 * P, 4.2 * PH, false), 0xffd23a)]);
+})();
+(() => { // column
+  const st = allStuds(2, 2, 12);
+  piece('column', 'Column', 'home', 2, 2, 12, [fixed([cellBox(0, 0, 0, 2, 1, 2), cellBox(0, 11, 0, 2, 12, 2), cyl(0.72 * P, 0.78 * P, 10 * PH, 20, P, P, PH), ...studsAt(st)], 'self')], { studs: st });
+})();
+(() => { // railing
+  const g = [rbox(0.4 * P, 0, 0.35 * P, 0.6 * P, 6 * PH - GAP, 0.65 * P, 0.002), rbox(3.4 * P, 0, 0.35 * P, 3.6 * P, 6 * PH - GAP, 0.65 * P, 0.002),
+    rbox(GAP, 5.3 * PH, 0.3 * P, 4 * P - GAP, 6 * PH - GAP, 0.7 * P, 0.002), rbox(GAP, 0.6 * PH, 0.4 * P, 4 * P - GAP, 1.1 * PH, 0.6 * P, 0.001)];
+  for (let i = 2; i < 7; i++) { const x = i * 0.5 * P; g.push(rbox(x - 0.05 * P, 1.1 * PH, 0.45 * P, x + 0.05 * P, 5.3 * PH, 0.55 * P, 0.0008)); }
+  piece('railing', 'Railing', 'home', 4, 1, 6, [fixed(g, 'self')]);
+})();
+(() => { // roof tiles (shingled slope)
+  const pts = [[0, 0], [2, 0], [2, 1]]; let zs = 2, ys = 1;
+  for (let i = 1; i <= 4; i++) { const ze = 2 - i * 0.25, ye = 1 + i * 0.5; if (i > 1) pts.push([zs + 0.06, ys - 0.3]); pts.push([ze, ye]); zs = ze; ys = ye; }
+  pts.push([0, 3]);
+  const st = backStuds(4, 3);
+  piece('rooftile', 'Roof Tiles', 'home', 4, 2, 3, [fixed([extrudeX(pts, 4, 2, 3), ...studsAt(st)], 'self')], { studs: st });
+})();
+(() => { // chimney
+  const cap = rbox(GAP, 8 * PH, GAP, 2 * P - GAP, 9 * PH - GAP, 2 * P - GAP);
+  const hole = rbox(0.45 * P, 9 * PH - GAP - 0.0004, 0.45 * P, 1.55 * P, 9 * PH - GAP + 0.0006, 1.55 * P, 0.0003);
+  piece('chimney', 'Chimney', 'home', 2, 2, 9, [fixed(cellBox(0, 0, 0, 2, 8, 2), 'self'), fixed(cap, 0x4a4e54), fixed(hole, 0x111214)]);
+})();
+(() => { // flower box
+  const soil = rbox(0.15 * P, 1.6 * PH, 0.15 * P, 3.85 * P, 2.1 * PH, 0.85 * P, 0.001);
+  const leaves = [], blooms = [];
+  for (let i = 0; i < 4; i++) { const x = (i + 0.5) * P; leaves.push(sph(0.22 * P, x, 2.3 * PH, 0.5 * P, 10, 8)); blooms.push(sph(0.15 * P, x + 0.08 * P, 2.7 * PH, 0.45 * P, 10, 8)); }
+  piece('fbox', 'Flower Box', 'home', 4, 1, 3, [fixed(cellBox(0, 0, 0, 4, 2, 1), 'self'), fixed(soil, 0x5a3a22), fixed(leaves, 0x3f9b3f), fixed(blooms, 0xff6fa8)]);
+})();
+(() => { // garage door (opens upward)
+  const h = 12, studs = allStuds(6, 1, h);
+  const frame = [cellBox(0, 0, 0, 1, h, 1), cellBox(5, 0, 0, 6, h, 1), cellBox(1, 10, 0, 5, h, 1), ...studsAt(studs)];
+  const panel = [rbox(P + 0.0015, 0.0005, 0.33 * P, 5 * P - 0.0015, 10 * PH - 0.0015, 0.67 * P, 0.002)];
+  for (const y of [2.5, 5, 7.5]) panel.push(rbox(P + 0.003, y * PH - 0.0012, 0.66 * P, 5 * P - 0.003, y * PH + 0.0012, 0.7 * P, 0.0005));
+  const openCells = []; for (let x = 1; x < 5; x++) for (let y = 0; y < 10; y++) openCells.push([x, y, 0]);
+  piece('garage', 'Garage Door', 'home', 6, 1, h, [fixed(frame, 'self'), fixed(panel, 'light', 'plastic', { door: true, hinge: [0, 10 * PH, 0.5 * P], axis: 'x', openA: 1.45 })], { studs, openCells, door: true });
+})();
+
+// ---- Nature
+(() => {
+  const g = new THREE.DodecahedronGeometry(0.9 * P, 0); g.scale(1.05, 0.62, 0.95); g.rotateY(0.6); g.translate(P, 0.62 * 0.9 * P, P);
+  piece('rock', 'Rock', 'nature', 2, 2, 3, [fixed(g, 'self')]);
+})();
+(() => {
+  const g = new THREE.IcosahedronGeometry(1.85 * P, 0); g.scale(1, 0.92, 0.92); g.rotateY(0.4); g.translate(2 * P, 1.85 * P * 0.92, 2 * P);
+  piece('boulder', 'Boulder', 'nature', 4, 4, 9, [fixed(g, 'self')]);
+})();
+piece('bush', 'Bush', 'nature', 2, 2, 4, [fixed([sph(0.75 * P, P, 1.8 * PH, P), sph(0.5 * P, 0.6 * P, 1.5 * PH, 0.7 * P), sph(0.5 * P, 1.4 * P, 1.5 * PH, 1.3 * P), sph(0.45 * P, 1.2 * P, 2.6 * PH, 0.8 * P)], 'self')]);
+(() => {
+  const c = [];
+  [[3, 6, 0.98], [7.5, 5.5, 0.78], [11.5, 6, 0.58]].forEach(([y, h, r]) => { const g = new THREE.CylinderGeometry(0, r * P, h * PH, 14); g.translate(P, (y + h / 2) * PH, P); c.push(g); });
+  piece('pine', 'Pine Tree', 'nature', 2, 2, 18, [fixed(cyl(0.2 * P, 0.26 * P, 4 * PH, 8, P, P, 0), 0x6b4226), fixed(c, 'self')]);
+})();
+piece('oak', 'Round Tree', 'nature', 4, 4, 18, [fixed(cyl(0.32 * P, 0.4 * P, 9 * PH, 10, 2 * P, 2 * P, 0), 0x6b4226),
+  fixed([sph(1.7 * P, 2 * P, 12 * PH, 2 * P, 18, 12), sph(1.05 * P, 1.2 * P, 13 * PH, 2.6 * P), sph(1.05 * P, 2.8 * P, 13.4 * PH, 1.5 * P), sph(0.95 * P, 2.2 * P, 15.2 * PH, 2.2 * P)], 'self')]);
+(() => { // palm
+  const trunk = []; let x = P; const z = P;
+  for (let i = 0; i < 6; i++) { const g = new THREE.CylinderGeometry(0.17 * P, 0.21 * P, 3.2 * PH, 8); g.translate(x, (i * 3 + 1.6) * PH, z); trunk.push(g); x += 0.05 * P; }
+  const top = 18.5 * PH, leaves = [];
+  for (let i = 0; i < 7; i++) { const g = new THREE.BoxGeometry(1.7 * P, 0.05 * P, 0.42 * P); g.translate(0.85 * P, 0, 0); g.rotateZ(-0.45); g.rotateY(i * Math.PI * 2 / 7); g.translate(x, top, z); leaves.push(g); }
+  const nuts = [sph(0.14 * P, x + 0.15 * P, top - 0.3 * PH, z), sph(0.14 * P, x - 0.1 * P, top - 0.35 * PH, z + 0.13 * P), sph(0.14 * P, x - 0.05 * P, top - 0.3 * PH, z - 0.15 * P)];
+  piece('palm', 'Palm Tree', 'nature', 2, 2, 21, [fixed(trunk, 0x9b7a4d), fixed(leaves, 'self'), fixed(nuts, 0x5a3a22)]);
+})();
+piece('water', 'Water 8x8', 'nature', 8, 8, 1, [fixed(rbox(GAP, 0, GAP, 8 * P - GAP, 0.8 * PH, 8 * P - GAP, 0.001), 'glass', 'glass')]);
+(() => { // mushroom
+  const cap = new THREE.SphereGeometry(0.98 * P, 20, 10, 0, Math.PI * 2, 0, HALF); cap.scale(1, 0.7, 1); cap.translate(P, 3.3 * PH, P);
+  const under = new THREE.CircleGeometry(0.98 * P, 20); under.rotateX(HALF); under.translate(P, 3.3 * PH, P);
+  const spots = [];
+  [[0.5, 0], [0.5, 2.1], [0.5, 4.2], [0.9, 1], [0.9, 3.1], [0.9, 5.2], [0.12, 0]].forEach(([ph, th]) => {
+    const r = 0.98 * P; spots.push(sph(0.13 * P, P + Math.sin(ph) * Math.cos(th) * r, 3.3 * PH + Math.cos(ph) * r * 0.7, P + Math.sin(ph) * Math.sin(th) * r, 8, 6));
+  });
+  piece('mushroom', 'Mushroom', 'nature', 2, 2, 6, [fixed([cyl(0.3 * P, 0.42 * P, 3.4 * PH, 12, P, P, 0), under], 0xf3ead6), fixed(cap, 'self'), fixed(spots, 0xffffff)]);
+})();
+(() => { // log
+  const r = 0.95 * P, L = 6 * P - 2 * GAP;
+  const bark = new THREE.CylinderGeometry(r, r, L, 18, 1, true); bark.rotateZ(HALF); bark.translate(3 * P, r, P);
+  const ends = []; for (const x of [GAP, 6 * P - GAP]) { const c = new THREE.CircleGeometry(r, 18); c.rotateY(x < P ? -HALF : HALF); c.translate(x, r, P); ends.push(c); }
+  piece('log', 'Log', 'nature', 6, 2, 5, [fixed(bark, 'self'), fixed(ends, 0xd9b98a)]);
+})();
+(() => { // flower patch
+  const base = rbox(GAP, 0, GAP, 2 * P - GAP, 0.5 * PH, 2 * P - GAP, 0.001), stems = [], pet = [], ctr = [];
+  [[0.5, 0.5, 1.5], [1.5, 0.6, 1.7], [0.6, 1.5, 1.6], [1.45, 1.45, 1.4]].forEach(([cx, cz, hh]) => {
+    stems.push(cyl(0.04 * P, 0.04 * P, (hh - 0.5) * PH, 5, cx * P, cz * P, 0.5 * PH));
+    for (let i = 0; i < 5; i++) { const a = i * Math.PI * 2 / 5; pet.push(sph(0.12 * P, (cx + 0.14 * Math.cos(a)) * P, hh * PH, (cz + 0.14 * Math.sin(a)) * P, 8, 6)); }
+    ctr.push(sph(0.08 * P, cx * P, hh * PH + 0.002, cz * P, 8, 6));
+  });
+  piece('fpatch', 'Flower Patch', 'nature', 2, 2, 2, [fixed([base, ...stems], 0x3f9b3f), fixed(pet, 'self'), fixed(ctr, 0xffd23a)]);
+})();
+(() => { // cactus
+  const g = [cyl(0.42 * P, 0.45 * P, 10 * PH, 14, P, P, 0), sph(0.42 * P, P, 10 * PH, P, 14, 8)];
+  for (const s of [-1, 1]) {
+    const ax = P + s * 0.72 * P, yb = (s < 0 ? 4.5 : 5.5) * PH;
+    const arm = new THREE.CylinderGeometry(0.16 * P, 0.16 * P, 0.5 * P, 10); arm.rotateZ(HALF); arm.translate(P + s * 0.55 * P, yb, P);
+    g.push(arm, cyl(0.18 * P, 0.18 * P, 3 * PH, 10, ax, P, yb), sph(0.18 * P, ax, yb + 3 * PH, P, 10, 6));
+  }
+  piece('cactus', 'Cactus', 'nature', 2, 2, 12, [fixed(g, 'self')]);
+})();
+(() => { // stone path
+  const s = [];
+  [[0.55, 0.5, 0.42], [1.45, 0.62, 0.4], [0.62, 1.48, 0.38], [1.5, 1.5, 0.36]].forEach(([x, z, r], i) => {
+    const g = new THREE.CylinderGeometry(r * P, r * P * 1.05, 0.6 * PH, 7); g.rotateY(i); g.translate(x * P, 0.3 * PH, z * P); s.push(flat(g));
+  });
+  piece('stones', 'Stone Path', 'nature', 2, 2, 1, [fixed(s, 'self')]);
+})();
+
+// ---- City
+const ROADTOP = 0.7 * PH;
+const roadBase = () => rbox(GAP, 0, GAP, 8 * P - GAP, ROADTOP, 8 * P - GAP, 0.001);
+const lineBox = (x0, z0, x1, z1) => rbox(x0 * P, ROADTOP - 0.0003, z0 * P, x1 * P, ROADTOP + 0.0006, z1 * P, 0.0003);
+const arcLine = (cx, cz, R, a0, a1, n, w, dash) => {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const t0 = a0 + (a1 - a0) * i / n, t1 = a0 + (a1 - a0) * (i + (dash ? 0.6 : 1.02)) / n, tm = (t0 + t1) / 2, len = R * Math.abs(t1 - t0) * P;
+    const g = new THREE.BoxGeometry(w * P, 0.0009, len); g.rotateY(-tm); g.translate((cx + R * Math.cos(tm)) * P, ROADTOP + 0.00015, (cz + R * Math.sin(tm)) * P);
+    out.push(g);
+  }
+  return out;
+};
+(() => {
+  const y = []; for (let i = 0; i < 4; i++) y.push(lineBox(3.92, i * 2 + 0.4, 4.08, i * 2 + 1.6));
+  piece('road', 'Road', 'city', 8, 8, 1, [fixed(roadBase(), 'self'), fixed(y, 0xf2c230), fixed([lineBox(0.45, 0.02, 0.6, 7.98), lineBox(7.4, 0.02, 7.55, 7.98)], 0xf4f4f4)]);
+})();
+piece('roadc', 'Road Corner', 'city', 8, 8, 1, [fixed(roadBase(), 'self'), fixed(arcLine(0, 0, 4, 0, HALF, 6, 0.16, true), 0xf2c230),
+  fixed([...arcLine(0, 0, 7.48, 0, HALF, 24, 0.15, false), ...arcLine(0, 0, 0.53, 0, HALF, 4, 0.15, false)], 0xf4f4f4)]);
+(() => {
+  const s = [];
+  for (let i = 0; i < 5; i++) { const a = 1.6 + i; s.push(lineBox(a, 0.3, a + 0.5, 1.5), lineBox(a, 6.5, a + 0.5, 7.7), lineBox(0.3, a, 1.5, a + 0.5), lineBox(6.5, a, 7.7, a + 0.5)); }
+  piece('cross', 'Crossing', 'city', 8, 8, 1, [fixed(roadBase(), 'self'), fixed(s, 0xf4f4f4)]);
+})();
+(() => {
+  const top = PH - GAP * 0.6, seams = [];
+  for (let x = 2; x < 8; x += 2) seams.push(rbox(x * P - 0.0006, top - 0.0004, GAP, x * P + 0.0006, top + 0.0003, 4 * P - GAP, 0.0002));
+  seams.push(rbox(GAP, top - 0.0004, 2 * P - 0.0006, 8 * P - GAP, top + 0.0003, 2 * P + 0.0006, 0.0002));
+  piece('sidewalk', 'Sidewalk', 'city', 8, 4, 1, [fixed(cellBox(0, 0, 0, 8, 1, 4), 'self'), fixed(seams, 'dark')]);
+})();
+(() => { // street sign
+  const pole = [cyl(0.08 * P, 0.08 * P, 10.6 * PH, 8, 0.5 * P, 0.5 * P, 0), cyl(0.3 * P, 0.35 * P, 0.5 * PH, 10, 0.5 * P, 0.5 * P, 0)];
+  const oct = (r, z, t) => { const g = new THREE.CylinderGeometry(r, r, t, 8); g.rotateX(HALF); g.rotateZ(Math.PI / 8); g.translate(0.5 * P, 10.5 * PH, z); return g; };
+  piece('sign', 'Street Sign', 'city', 1, 1, 12, [fixed(pole, 0x8a9096), fixed(oct(0.5 * P, 0.6 * P, 0.06 * P), 0xf4f4f4), fixed(oct(0.44 * P, 0.63 * P, 0.07 * P), 'self')]);
+})();
+(() => { // traffic light
+  const pole = [cyl(0.09 * P, 0.09 * P, 10 * PH, 8, 0.5 * P, 0.5 * P, 0), cyl(0.3 * P, 0.35 * P, 0.5 * PH, 10, 0.5 * P, 0.5 * P, 0)];
+  const box = rbox(0.18 * P, 9.6 * PH, 0.22 * P, 0.82 * P, 15 * PH - GAP, 0.78 * P, 0.003);
+  const L = (y, c) => fixed(sph(0.17 * P, 0.5 * P, y * PH, 0.74 * P, 12, 8), c, 'lit');
+  piece('tlight', 'Traffic Light', 'city', 1, 1, 15, [fixed(pole, 0x8a9096), fixed(box, 'self'), L(13.9, 0xff4a3a), L(12.3, 0xffcf33), L(10.7, 0x3fe07a)]);
+})();
+(() => { // bench (minifigs can sit on it)
+  const legs = [];
+  for (const x of [0.3, 3.4]) legs.push(rbox(x * P, 0, 0.3 * P, (x + 0.3) * P, 2.5 * PH, 1.7 * P, 0.0015), rbox(x * P, 2.5 * PH, 0.05 * P, (x + 0.3) * P, 5 * PH - GAP, 0.3 * P, 0.0015));
+  const slats = [];
+  for (let i = 0; i < 3; i++) slats.push(rbox(GAP, 2.5 * PH, (0.35 + i * 0.5) * P, 4 * P - GAP, 3 * PH - GAP * 0.6, (0.78 + i * 0.5) * P, 0.0012));
+  for (let i = 0; i < 2; i++) slats.push(rbox(GAP, (3.4 + i * 0.75) * PH, 0.1 * P, 4 * P - GAP, (3.9 + i * 0.75) * PH, 0.3 * P, 0.0012));
+  const cells = [], studs = [];
+  for (let x = 0; x < 4; x++) { for (let z = 0; z < 2; z++) for (let y = 0; y < 3; y++) cells.push([x, y, z]); for (let y = 3; y < 5; y++) cells.push([x, y, 0]); studs.push([x, 1, 3]); }
+  piece('bench', 'Bench', 'city', 4, 2, 5, [fixed(legs, 0x3a3d42), fixed(slats, 'self')], { cells, studs });
+})();
+(() => { // hydrant
+  const g = [cyl(0.3 * P, 0.34 * P, 2.1 * PH, 12, 0.5 * P, 0.5 * P, 0.2 * PH), cyl(0.4 * P, 0.4 * P, 0.25 * PH, 12, 0.5 * P, 0.5 * P, 0)];
+  const dome = new THREE.SphereGeometry(0.3 * P, 12, 6, 0, Math.PI * 2, 0, HALF); dome.scale(1, 0.7, 1); dome.translate(0.5 * P, 2.3 * PH, 0.5 * P); g.push(dome);
+  const noz = new THREE.CylinderGeometry(0.1 * P, 0.1 * P, 0.86 * P, 8); noz.rotateZ(HALF); noz.translate(0.5 * P, 1.5 * PH, 0.5 * P); g.push(noz);
+  piece('hydrant', 'Hydrant', 'city', 1, 1, 3, [fixed(g, 'self')]);
+})();
+piece('mailbox', 'Mailbox', 'city', 1, 1, 6, [fixed(rbox(0.42 * P, 0, 0.42 * P, 0.58 * P, 3.6 * PH, 0.58 * P, 0.001), 0x8a9096),
+  fixed(rbox(0.12 * P, 3.5 * PH, 0.04 * P, 0.88 * P, 5.8 * PH, 0.96 * P, 0.011), 'self'), fixed(rbox(0.88 * P, 4.2 * PH, 0.6 * P, 0.94 * P, 5.4 * PH, 0.75 * P, 0.0008), 0xe5483d)]);
+piece('tcan', 'Trash Can', 'city', 2, 2, 5, [fixed(cyl(0.72 * P, 0.62 * P, 4.3 * PH, 18, P, P, 0), 'self'), fixed(cyl(0.8 * P, 0.8 * P, 0.6 * PH, 18, P, P, 4.3 * PH), 0x3a3d42)]);
+(() => { // bus stop (walk under it)
+  const cells = [];
+  for (let x = 0; x < 6; x++) { for (let z = 0; z < 2; z++) cells.push([x, 11, z]); for (let y = 0; y < 11; y++) cells.push([x, y, 0]); }
+  for (const x of [0, 5]) for (let y = 0; y < 11; y++) cells.push([x, y, 1]);
+  const posts = [];
+  for (const [x, z] of [[0.3, 0.3], [5.7, 0.3], [0.3, 1.7], [5.7, 1.7]]) posts.push(cyl(0.1 * P, 0.1 * P, 11 * PH, 8, x * P, z * P, 0));
+  posts.push(rbox(0.5 * P, 2.6 * PH, 0.35 * P, 5.5 * P, 3.1 * PH, 1.1 * P, 0.0015));
+  piece('busstop', 'Bus Stop', 'city', 6, 2, 12, [fixed(cellBox(0, 11, 0, 6, 12, 2), 'self'), fixed(posts, 0x8a9096), fixed(rbox(0.4 * P, 1.2 * PH, 0.12 * P, 5.6 * P, 10.8 * PH, 0.26 * P, 0.001), 0xcfeaff, 'glass')], { cells });
+})();
+(() => { // billboard
+  const cells = [];
+  for (let x = 0; x < 6; x++) for (let y = 8; y < 15; y++) cells.push([x, y, 0]);
+  for (const x of [1, 4]) for (let y = 0; y < 8; y++) cells.push([x, y, 0]);
+  const posts = [rbox(1.3 * P, 0, 0.35 * P, 1.6 * P, 8 * PH, 0.65 * P, 0.002), rbox(4.4 * P, 0, 0.35 * P, 4.7 * P, 8 * PH, 0.65 * P, 0.002)];
+  const ad = [rbox(0.6 * P, 10.2 * PH, 0.74 * P, 3.4 * P, 11 * PH, 0.8 * P, 0.0005), rbox(0.6 * P, 11.8 * PH, 0.74 * P, 3.6 * P, 12.6 * PH, 0.8 * P, 0.0005)];
+  const sun2 = new THREE.CircleGeometry(0.75 * P, 20); sun2.translate(4.6 * P, 12.2 * PH, 0.795 * P);
+  piece('billboard', 'Billboard', 'city', 6, 1, 15, [fixed(posts, 0x8a9096), fixed(rbox(GAP, 8 * PH, 0.25 * P, 6 * P - GAP, 15 * PH - GAP, 0.75 * P), 'self'),
+    fixed(rbox(0.3 * P, 8.6 * PH, 0.7 * P, 5.7 * P, 14.4 * PH, 0.76 * P, 0.0008), 0xf7f7f2), fixed(ad, 0x2f7cf6), fixed(sun2, 0xff8a18)], { cells });
+})();
+
+const CATS = ['bricks', 'plates', 'slopes', 'house', 'shapes', 'home', 'nature', 'city', 'fun'];
+
+/* ---- Minifigures (2 studs wide, 3 bricks tall: same size as you in shrink mode) ---- */
+function figParts(yo) {
+  const cx = P, cz = 0.5 * P, parts = [];
+  const add = (g, extra) => parts.push({ g: Array.isArray(g) ? merge(g) : N(g), tint: 'self', mat: 'plastic', ...extra });
+  const up = g => { g.translate(0, yo, 0); return g; };
+  const bx = (x0, y0, z0, x1, y1, z1, r = 0.002) => up(rbox(x0, y0, z0, x1, y1, z1, r));
+  for (const s of [-1, 1]) {
+    const x0 = s < 0 ? cx - 0.036 : cx + 0.002, x1 = s < 0 ? cx - 0.002 : cx + 0.036;
+    add([bx(x0, 0.012, cz - 0.015, x1, 0.05, cz + 0.015), bx(x0, 0, cz - 0.015, x1, 0.012, cz + 0.021)],
+      { fc: 'pants', pose: s < 0 ? 'legL' : 'legR', pivot: [cx + s * 0.019, 0.05 + yo, cz], axis: 'x' });
+  }
+  add(bx(cx - 0.036, 0.05, cz - 0.014, cx + 0.036, 0.058, cz + 0.014), { fc: 'pants' });
+  const ts = new THREE.Shape();
+  ts.moveTo(cx - 0.037, 0.058); ts.lineTo(cx + 0.037, 0.058); ts.lineTo(cx + 0.029, 0.104); ts.lineTo(cx - 0.029, 0.104); ts.lineTo(cx - 0.037, 0.058);
+  const tg = new THREE.ExtrudeGeometry(ts, { depth: 0.028, bevelEnabled: false }); tg.translate(0, yo, cz - 0.014);
+  add(tg, { fc: 'shirt' });
+  for (const s of [-1, 1]) {
+    const ax = cx + s * 0.04, sh = 0.098, pose = s < 0 ? 'armL' : 'armR', pivot = [ax, sh + yo, cz];
+    const arm = new THREE.CylinderGeometry(0.0075, 0.0088, 0.036, 10); arm.translate(ax, sh - 0.018 + yo, cz);
+    add(arm, { fc: 'shirt', pose, pivot, axis: 'x' });
+    const hand = new THREE.CylinderGeometry(0.0058, 0.0058, 0.009, 10); hand.translate(ax, sh - 0.041 + yo, cz + 0.002);
+    add(hand, { fc: 'skin', pose, pivot, axis: 'x' });
+  }
+  const hp = { pose: 'head', pivot: [cx, 0.105 + yo, cz], axis: 'y' };
+  const head = new THREE.CylinderGeometry(0.0185, 0.0185, 0.026, 20); head.translate(cx, 0.123 + yo, cz);
+  add([cyl(0.0075, 0.0075, 0.006, 10, cx, cz, 0.104 + yo), head, cyl(0.009, 0.009, 0.004, 12, cx, cz, 0.136 + yo)], { fc: 'skin', ...hp });
+  // faces: smile, grin, cool, wow
+  const zf = dx => cz + Math.sqrt(0.0185 * 0.0185 - dx * dx);
+  const eyes = () => [-0.0065, 0.0065].map(dx => sph(0.0024, cx + dx, 0.127 + yo, zf(dx), 8, 6));
+  const smile = (r, y) => { const g = new THREE.TorusGeometry(r, 0.0012, 4, 12, Math.PI); g.rotateZ(Math.PI); g.translate(cx, y + yo, cz + 0.0182); return g; };
+  const disc = (r, y, half) => { const g = new THREE.CircleGeometry(r, 14, half ? Math.PI : 0, half ? Math.PI : Math.PI * 2); g.translate(cx, y + yo, cz + 0.0188); return g; };
+  const faces = [
+    [...eyes(), smile(0.0062, 0.121)],
+    [...eyes(), disc(0.0075, 0.1205, true)],
+    [bx(cx - 0.0135, 0.1235, cz + 0.0145, cx + 0.0135, 0.1305, cz + 0.0205, 0.0012), smile(0.0045, 0.1185)],
+    [...eyes(), disc(0.0033, 0.1175, false)],
+  ];
+  faces.forEach((list, n) => add(list, { tint: 0x1b1b1b, ...hp, vis: f => f[5] === n }));
+  // hair / hats: none, short, long, cap, helmet, crown
+  const hemi = (r, y, frac, sy = 1) => { const g = new THREE.SphereGeometry(r, 18, 8, 0, Math.PI * 2, 0, Math.PI * frac); g.scale(1, sy, 1); g.translate(cx, y + yo, cz); return g; };
+  const hairs = [
+    null,
+    [hemi(0.0205, 0.127, 0.5, 0.82), bx(cx - 0.019, 0.112, cz - 0.0205, cx + 0.019, 0.13, cz - 0.008)],
+    [hemi(0.0205, 0.127, 0.5, 0.82), bx(cx - 0.021, 0.098, cz - 0.022, cx + 0.021, 0.13, cz - 0.004),
+      bx(cx - 0.022, 0.104, cz - 0.01, cx - 0.017, 0.13, cz + 0.008), bx(cx + 0.017, 0.104, cz - 0.01, cx + 0.022, 0.13, cz + 0.008)],
+    [hemi(0.0198, 0.132, 0.5), bx(cx - 0.014, 0.13, cz + 0.01, cx + 0.014, 0.1325, cz + 0.031, 0.001)],
+    [hemi(0.0235, 0.122, 0.6)],
+  ];
+  hairs.forEach((list, n) => { if (list) add(list, { fc: 'hair', ...hp, vis: f => f[4] === n }); });
+  const crown = [up(cyl(0.0178, 0.0178, 0.006, 16, cx, cz, 0.136))];
+  for (let i = 0; i < 5; i++) {
+    const a = i * Math.PI * 2 / 5, g = new THREE.CylinderGeometry(0, 0.003, 0.007, 6);
+    g.translate(cx + 0.016 * Math.cos(a), 0.1455 + yo, cz + 0.016 * Math.sin(a)); crown.push(g);
+  }
+  add(crown, { tint: 0xf2c230, ...hp, vis: f => f[4] === 5 });
+  return parts;
+}
+const figCells = sit => {
+  const c = [];
+  for (let x = 0; x < 2; x++) {
+    if (!sit) for (let y = 0; y < 9; y++) c.push([x, y, 0]);
+    else { for (let y = 0; y < 7; y++) c.push([x, y, 0]); for (let y = 0; y < 2; y++) c.push([x, y, 1]); }
+  }
+  return c;
+};
+def({ id: 'fig', name: 'Minifig', cat: 'people', w: 2, d: 1, h: 9, cells: figCells(false), fig: 'stand', parts: figParts(0) });
+def({ id: 'figsit', name: 'Minifig (sitting)', cat: 'people', w: 2, d: 2, h: 7, cells: figCells(true), fig: 'sit', parts: figParts(-0.035) });
+
+/* ---- 2x / 4x versions of any piece, made on demand (ids like "b2x4@2") ---- */
+function scaledType(base, k) {
+  const id = base.id + '@' + k;
+  if (T[id]) return T[id];
+  const sc = list => list.flatMap(([x, y, z]) => {
+    const o = [];
+    for (let i = 0; i < k; i++) for (let j = 0; j < k; j++) for (let l = 0; l < k; l++) o.push([x * k + i, y * k + j, z * k + l]);
+    return o;
+  });
+  const studs = base.studs.flatMap(([x, z, ty]) => { const o = []; for (let i = 0; i < k; i++) for (let l = 0; l < k; l++) o.push([x * k + i, z * k + l, ty * k]); return o; });
+  const parts = base.parts.map(p => {
+    const hasStud = p.g.userData.noStud !== undefined, body = hasStud ? p.g.userData.noStud : p.g, list = [];
+    if (body) { const g = body.clone(); g.scale(k, k, k); list.push(g); }
+    if (hasStud) list.push(...studsAt(studs));
+    const q = { ...p, g: list.length > 1 ? merge(list) : N(list[0]) };
+    if (p.hinge) q.hinge = p.hinge.map(v => v * k);
+    if (p.pivot) q.pivot = p.pivot.map(v => v * k);
+    return q;
+  });
+  const o = def({ id, name: base.name + ' x' + k, cat: 'scaled', w: base.w * k, d: base.d * k, h: base.h * k, cells: sc(base.cells), studs,
+    openCells: base.openCells ? sc(base.openCells) : undefined, door: base.door, fig: base.fig, parts });
+  o.base = base.id; o.k = k;
+  return o;
+}
+function typeById(id) {
+  if (T[id]) return T[id];
+  const m = /^(.+)@(\d)$/.exec(id || '');
+  return m && T[m[1]] ? scaledType(T[m[1]], +m[2]) : null;
+}
+
+/* =========================================================
+   BATCHED RENDERING (one instanced mesh per piece part)
+   ========================================================= */
+/* per-part transforms: doors, minifig poses, hidden variants */
+const SKIN = [0xf5cf3a, 0xf6d7b0, 0xe8b98a, 0xc68a5a, 0x8d5a3b, 0x5c3a24];
+// minifig data: [shirt, pants, skin, hairColor, hairStyle, face, headYaw, armL, armR, legL, legR]
+const DEF_FIG = [4, 13, 0, 8, 1, 0, 0, 0, 0, 0, 0];
+const POSE_IX = { head: 6, armL: 7, armR: 8, legL: 9, legR: 10 };
+const _pm = new THREE.Matrix4(), _pr = new THREE.Matrix4();
+function partLocal(part, br, out) {
+  out.identity();
+  const f = br.f || DEF_FIG;
+  if (part.vis && !part.vis(f)) return out.makeScale(0, 0, 0);
+  let a = 0, piv = null, ax = 'y';
+  if (part.door && br.ang) { a = br.ang * part.openA; piv = part.hinge; ax = part.axis; }
+  else if (part.pose) { a = f[POSE_IX[part.pose]] || 0; piv = part.pivot; ax = part.axis; }
+  if (a && piv) {
+    if (ax === 'x') _pr.makeRotationX(a); else _pr.makeRotationY(a);
+    out.makeTranslation(piv[0], piv[1], piv[2]).multiply(_pr).multiply(_pm.makeTranslation(-piv[0], -piv[1], -piv[2]));
+  }
+  return out;
+}
+function partColor(br, part, out) {
+  if (part.fc) {
+    const f = br.f || DEF_FIG;
+    if (part.fc === 'skin') return out.set(SKIN[f[2]] ?? SKIN[0]);
+    return out.set(PALETTE[f[part.fc === 'shirt' ? 0 : part.fc === 'pants' ? 1 : 3]] ?? 0xffffff);
+  }
+  return tintColor(PALETTE[br.c], part.tint, out);
+}
+
+class BatchSet {
+  constructor(parent, mode) {
+    this.parent = parent; this.mode = mode; this.b = new Map(); this.inst = new Map();
+    if (mode === 'ghost') this.mat = new THREE.MeshBasicMaterial({ color: 0x3d9bff, transparent: true, opacity: 0.42, depthWrite: false });
+  }
+  batch(t, pi) {
+    const key = t.idx * 8 + pi;
+    let B = this.b.get(key);
+    if (!B) { B = { key, t, pi, mesh: null, cap: 0, count: 0, ids: [] }; this.grow(B, 16); this.b.set(key, B); }
+    return B;
+  }
+  grow(B, cap) {
+    const part = B.t.parts[B.pi];
+    const mat = this.mode === 'ghost' ? this.mat : MAT[part.mat];
+    const m = new THREE.InstancedMesh(part.g, mat, cap);
+    m.frustumCulled = false;
+    if (this.mode !== 'ghost') {
+      m.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3), 3);
+      m.castShadow = part.mat !== 'glass'; m.receiveShadow = true;
+    }
+    if (part.mat === 'glass') m.renderOrder = 2;
+    if (B.mesh) {
+      m.instanceMatrix.array.set(B.mesh.instanceMatrix.array);
+      if (m.instanceColor && B.mesh.instanceColor) m.instanceColor.array.set(B.mesh.instanceColor.array);
+      this.parent.remove(B.mesh); B.mesh.dispose();
+    }
+    m.count = B.count; m.visible = B.count > 0;
+    B.mesh = m; B.cap = cap; this.parent.add(m);
+  }
+  writeM(B, i, br, part) {
+    _m.makeRotationY(br.r * HALF); _m.setPosition(br.x * P, br.y * PH, br.z * P);
+    if (part.door || part.pose || part.vis) _m.multiply(partLocal(part, br, _m2));
+    B.mesh.setMatrixAt(i, _m);
+  }
+  add(br) {
+    const t = TYPES[br.t], list = [];
+    for (let pi = 0; pi < t.parts.length; pi++) {
+      const B = this.batch(t, pi);
+      if (B.count >= B.cap) this.grow(B, B.cap * 2);
+      const i = B.count++;
+      B.ids[i] = br.id;
+      this.writeM(B, i, br, t.parts[pi]);
+      if (B.mesh.instanceColor) { partColor(br, t.parts[pi], _c); B.mesh.setColorAt(i, _c); B.mesh.instanceColor.needsUpdate = true; }
+      B.mesh.count = B.count; B.mesh.visible = true; B.mesh.instanceMatrix.needsUpdate = true;
+      list.push([B, i]);
+    }
+    this.inst.set(br.id, list);
+  }
+  update(br) {
+    const list = this.inst.get(br.id); if (!list) return;
+    for (const [B, i] of list) {
+      const part = B.t.parts[B.pi];
+      this.writeM(B, i, br, part); B.mesh.instanceMatrix.needsUpdate = true;
+      if (B.mesh.instanceColor && part.fc) { partColor(br, part, _c); B.mesh.setColorAt(i, _c); B.mesh.instanceColor.needsUpdate = true; }
+    }
+  }
+  remove(id) {
+    const list = this.inst.get(id); if (!list) return;
+    for (const [B, i] of list) {
+      const last = B.count - 1;
+      if (i !== last) {
+        const lid = B.ids[last];
+        B.mesh.getMatrixAt(last, _m); B.mesh.setMatrixAt(i, _m);
+        if (B.mesh.instanceColor) { B.mesh.getColorAt(last, _c); B.mesh.setColorAt(i, _c); B.mesh.instanceColor.needsUpdate = true; }
+        B.ids[i] = lid;
+        const ll = this.inst.get(lid);
+        if (ll) for (const e of ll) if (e[0] === B) e[1] = i;
+      }
+      B.ids.length = last; B.count = last; B.mesh.count = last; B.mesh.visible = last > 0;
+      B.mesh.instanceMatrix.needsUpdate = true;
+    }
+    this.inst.delete(id);
+  }
+  clear() { for (const B of this.b.values()) { B.count = 0; B.ids.length = 0; B.mesh.count = 0; B.mesh.visible = false; } this.inst.clear(); }
+  dispose() { for (const B of this.b.values()) { if (B.mesh.parent) B.mesh.parent.remove(B.mesh); B.mesh.dispose(); } this.b.clear(); this.inst.clear(); if (this.mat) this.mat.dispose(); }
+}
+
+/* =========================================================
+   WORLD (bricks + occupancy grid)
+   ========================================================= */
+const strip = b => { const o = { id: b.id, t: b.t, c: b.c, x: b.x, y: b.y, z: b.z, r: b.r }; if (b.f) o.f = b.f.slice(); return o; };
+const world = {
+  bricks: new Map(), occ: new Map(), batch: new BatchSet(scene, 'normal'), nextId: 1, idBase: 0, doors: new Set(), glue: new Map(), glueBy: new Map(),
+  cells(br) { return TYPES[br.t].rc[br.r].map(c => ({ x: c.x + br.x, y: c.y + br.y, z: c.z + br.z, top: c.top, bot: c.bot, open: c.open })); },
+  add(s) {
+    if (s.id > 0 && this.bricks.has(s.id)) this.remove(s.id);
+    const br = { id: s.id > 0 ? s.id : this.idBase + this.nextId++, t: s.t, c: s.c, x: s.x, y: s.y, z: s.z, r: s.r, open: false, ang: 0 };
+    if (s.f) br.f = s.f.slice();
+    if (s.id > 0 && s.id >= this.idBase && s.id < this.idBase + 1e9) this.nextId = Math.max(this.nextId, s.id - this.idBase + 1);
+    this.bricks.set(br.id, br);
+    for (const c of this.cells(br)) this.occ.set(_key(c.x, c.y, c.z), { id: br.id, top: c.top, bot: c.bot, open: c.open });
+    this.batch.add(br);
+    if (TYPES[br.t].door) this.doors.add(br.id);
+    dirty(); netOp({ t: 'add', s: strip(br) });
+    return br;
+  },
+  remove(id) {
+    const br = this.bricks.get(id); if (!br) return null;
+    for (const c of this.cells(br)) { const k = _key(c.x, c.y, c.z); const e = this.occ.get(k); if (e && e.id === id) this.occ.delete(k); }
+    this.dropGlueOf(id);
+    this.batch.remove(id); this.bricks.delete(id); this.doors.delete(id); animDoors.delete(id);
+    dirty(); netOp({ t: 'rem', id });
+    return strip(br);
+  },
+  clearAll() { this.glue.clear(); this.glueBy.clear(); glueDirty = true; this.bricks.clear(); this.occ.clear(); this.batch.clear(); this.doors.clear(); animDoors.clear(); dirty(); },
+  isSolid(x, y, z) {
+    if (y < 0) return true;
+    const e = this.occ.get(_key(x, y, z));
+    if (!e) return false;
+    if (e.open) { const b = this.bricks.get(e.id); if (b && b.open) return false; }
+    return true;
+  },
+  // connected build = bricks joined by studs (above / below)
+  component(id) {
+    const seen = new Set([id]), q = [id];
+    while (q.length) {
+      const cur = this.bricks.get(q.pop()); if (!cur) continue;
+      for (const c of this.cells(cur)) {
+        if (c.top) { const e = this.occ.get(_key(c.x, c.y + 1, c.z)); if (e && e.id !== cur.id && e.bot && !seen.has(e.id)) { seen.add(e.id); q.push(e.id); } }
+        if (c.bot) { const e = this.occ.get(_key(c.x, c.y - 1, c.z)); if (e && e.id !== cur.id && e.top && !seen.has(e.id)) { seen.add(e.id); q.push(e.id); } }
+      }
+      const gs = this.glueBy.get(cur.id);
+      if (gs) for (const k of gs) { const g = this.glue.get(k); if (!g) continue; const o = g.a === cur.id ? g.b : g.a; if (!seen.has(o)) { seen.add(o); q.push(o); } }
+    }
+    return [...seen];
+  },
+  gk(a, b) { return a < b ? a + '|' + b : b + '|' + a; },
+  addGlue(a, b) {
+    if (!a || !b || a === b || !this.bricks.has(a) || !this.bricks.has(b)) return;
+    const k = this.gk(a, b); if (this.glue.has(k)) return;
+    const p = this.contactPoint(a, b); if (!p) return;
+    this.glue.set(k, { a, b, p }); netOp({ t: 'glue', a, b });
+    for (const id of [a, b]) { let s = this.glueBy.get(id); if (!s) this.glueBy.set(id, s = new Set()); s.add(k); }
+    glueDirty = true;
+  },
+  dropGlueOf(id) {
+    const s = this.glueBy.get(id); if (!s) return;
+    for (const k of s) { const g = this.glue.get(k); if (!g) continue; this.glue.delete(k); const o = g.a === id ? g.b : g.a; const os = this.glueBy.get(o); if (os) os.delete(k); }
+    this.glueBy.delete(id); glueDirty = true;
+  },
+  linksOf(ids) {
+    const out = [], seen = new Set();
+    for (const id of ids) { const s = this.glueBy.get(id); if (s) for (const k of s) { if (seen.has(k)) continue; seen.add(k); const g = this.glue.get(k); if (g) out.push([g.a, g.b]); } }
+    return out;
+  },
+  // where to show the glue dot: on an outside edge of the touching faces
+  contactPoint(a, b) {
+    const br = this.bricks.get(a); let fb = null;
+    for (const c of this.cells(br)) for (const [dx, dy, dz] of NB6) {
+      const e = this.occ.get(_key(c.x + dx, c.y + dy, c.z + dz)); if (!e || e.id !== b) continue;
+      const fx = (c.x + 0.5 + dx * 0.5) * P, fy = (c.y + 0.5 + dy * 0.5) * PH, fz = (c.z + 0.5 + dz * 0.5) * P;
+      if (!fb) fb = new THREE.Vector3(fx, fy, fz);
+      if (dy === 0) {
+        if (!this.occ.has(_key(c.x, c.y + 1, c.z)) && !this.occ.has(_key(c.x + dx, c.y + 1, c.z + dz))) return new THREE.Vector3(fx, (c.y + 1) * PH, fz);
+      } else {
+        for (const [hx, hz] of [[1, 0], [-1, 0], [0, 1], [0, -1]])
+          if (!this.occ.has(_key(c.x + hx, c.y, c.z + hz)) && !this.occ.has(_key(c.x + hx, c.y + dy, c.z + hz)))
+            return new THREE.Vector3((c.x + 0.5 + hx * 0.5) * P, (dy > 0 ? c.y + 1 : c.y) * PH, (c.z + 0.5 + hz * 0.5) * P);
+      }
+    }
+    return fb;
+  },
+  // bricks touching this one that are NOT already joined to it by studs
+  touchPairs(id) {
+    const br = this.bricks.get(id), stud = new Set(), touch = new Set();
+    for (const c of this.cells(br)) for (const [dx, dy, dz] of NB6) {
+      const e = this.occ.get(_key(c.x + dx, c.y + dy, c.z + dz)); if (!e || e.id === id) continue;
+      touch.add(e.id);
+      if ((dy === 1 && c.top && e.bot) || (dy === -1 && c.bot && e.top)) stud.add(e.id);
+    }
+    return [...touch].filter(o => !stud.has(o));
+  },
+  nearest(p, rad, filter) {
+    const x0 = Math.floor((p.x - rad) / P), x1 = Math.floor((p.x + rad) / P);
+    const y0 = Math.max(0, Math.floor((p.y - rad) / PH)), y1 = Math.floor((p.y + rad) / PH);
+    const z0 = Math.floor((p.z - rad) / P), z1 = Math.floor((p.z + rad) / P);
+    let best = 0, bd = rad * rad;
+    for (let x = x0; x <= x1; x++) for (let z = z0; z <= z1; z++) for (let y = y0; y <= y1; y++) {
+      const e = this.occ.get(_key(x, y, z)); if (!e) continue;
+      if (filter && !filter(this.bricks.get(e.id))) continue;
+      const dx = Math.max(x * P - p.x, 0, p.x - (x + 1) * P), dy = Math.max(y * PH - p.y, 0, p.y - (y + 1) * PH), dz = Math.max(z * P - p.z, 0, p.z - (z + 1) * P);
+      const d = dx * dx + dy * dy + dz * dz;
+      if (d < bd) { bd = d; best = e.id; }
+    }
+    return best;
+  },
+};
+function dirty() { worldVer++; saveTimer = 1.5; }
+
+/* glue dots */
+const glueGeo = new THREE.SphereGeometry(0.0045, 10, 8);
+const glueMat = new THREE.MeshStandardMaterial({ color: 0xfff4cf, roughness: 0.05, metalness: 0, transparent: true, opacity: 0.85, emissive: 0x2a2210 });
+let glueMesh = null;
+function rebuildGlue() {
+  glueDirty = false;
+  const n = world.glue.size;
+  if (!glueMesh || glueMesh.userData.cap < n) {
+    if (glueMesh) { scene.remove(glueMesh); glueMesh.dispose(); }
+    const cap = Math.max(64, n * 2);
+    glueMesh = new THREE.InstancedMesh(glueGeo, glueMat, cap); glueMesh.userData.cap = cap; glueMesh.frustumCulled = false; scene.add(glueMesh);
+  }
+  let i = 0;
+  for (const g of world.glue.values()) { _m.makeTranslation(g.p.x, g.p.y, g.p.z); glueMesh.setMatrixAt(i++, _m); }
+  glueMesh.count = n; glueMesh.instanceMatrix.needsUpdate = true; glueMesh.visible = n > 0;
+}
+
+/* =========================================================
+   AUDIO (all synthesized)
+   ========================================================= */
+let AC = null, NB = null;
+function ac() {
+  try {
+    if (!AC) {
+      AC = new (window.AudioContext || window.webkitAudioContext)();
+      const len = Math.floor(AC.sampleRate * 0.4); NB = AC.createBuffer(1, len, AC.sampleRate);
+      const d = NB.getChannelData(0); for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (AC.state === 'suspended') AC.resume();
+  } catch (e) { }
+  return AC;
+}
+['pointerdown', 'click', 'keydown'].forEach(ev => window.addEventListener(ev, ac, { capture: true }));
+function env(g, t, a, v, dur) { g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + dur); }
+function noiseHit(f, q, v, dur, delay = 0, type = 'bandpass') {
+  if (!AC || !NB) return; const t = AC.currentTime + delay;
+  const s = AC.createBufferSource(); s.buffer = NB;
+  const fl = AC.createBiquadFilter(); fl.type = type; fl.frequency.value = f; fl.Q.value = q;
+  const g = AC.createGain(); env(g, t, 0.002, v, dur);
+  s.connect(fl).connect(g).connect(AC.destination); s.start(t); s.stop(t + dur + 0.02);
+}
+function tone(f0, f1, dur, v, type = 'sine', delay = 0) {
+  if (!AC) return; const t = AC.currentTime + delay;
+  const o = AC.createOscillator(); o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  const g = AC.createGain(); env(g, t, 0.005, v, dur);
+  o.connect(g).connect(AC.destination); o.start(t); o.stop(t + dur + 0.02);
+}
+const sClick = () => { noiseHit(3400, 3, 0.5, 0.035); noiseHit(2300, 4, 0.35, 0.04, 0.03); tone(1800, 1200, 0.03, 0.05, 'triangle'); };
+const sPop = () => { tone(420, 820, 0.07, 0.18); noiseHit(2600, 2, 0.12, 0.03); };
+const sTick = (v = 0.12) => noiseHit(4200, 5, v, 0.02);
+const sTrash = () => { noiseHit(900, 0.8, 0.35, 0.3, 0, 'lowpass'); tone(500, 90, 0.3, 0.12, 'triangle'); };
+const sWhoosh = () => noiseHit(1200, 0.7, 0.2, 0.25);
+const sDoor = () => { tone(260, 180, 0.18, 0.12, 'triangle'); noiseHit(1500, 3, 0.15, 0.04, 0.12); };
+const sShrink = () => tone(880, 140, 0.8, 0.15);
+const sGrow = () => tone(140, 880, 0.8, 0.15);
+const sMenu = open => open ? tone(520, 880, 0.09, 0.12) : tone(880, 520, 0.09, 0.12);
+const sJump = () => tone(300, 520, 0.1, 0.08);
+
+/* =========================================================
+   PLAYER RIG, LIGHTS, FLOOR
+   ========================================================= */
+const rig = new THREE.Group(); scene.add(rig);
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 3000);
+camera.position.set(0.55, 0.75, 0.05);
+rig.add(camera);
+camera.lookAt(0, 0.12, -0.9);
+
+const hemi = new THREE.HemisphereLight(0xffffff, 0xcfd5dd, 1.1); scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048); sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.003;
+scene.add(sun); scene.add(sun.target);
+const SUN_DIR = new THREE.Vector3(0.45, 1, 0.3).normalize();
+let shadowHalf = 4;
+function setShadowRange(half) {
+  shadowHalf = half;
+  const c = sun.shadow.camera; c.left = -half; c.right = half; c.top = half; c.bottom = -half; c.near = 0.01; c.far = half * 8;
+  c.updateProjectionMatrix();
+}
+setShadowRange(4);
+
+const TILE = 8 * P, FS = 2000;
+const floorTex = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 512; const g = c.getContext('2d');
+  g.fillStyle = '#ffffff'; g.fillRect(0, 0, 512, 512);
+  g.fillStyle = 'rgba(120,128,140,0.16)'; for (let i = 1; i < 8; i++) { g.fillRect(i * 64 - 1, 0, 2, 512); g.fillRect(0, i * 64 - 1, 512, 2); }
+  g.fillStyle = 'rgba(110,118,130,0.34)'; g.fillRect(0, 0, 3, 512); g.fillRect(509, 0, 3, 512); g.fillRect(0, 0, 512, 3); g.fillRect(0, 509, 512, 3);
+  const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy(); t.repeat.set(FS / TILE, FS / TILE);
+  return t;
+})();
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(FS, FS), new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.92, metalness: 0 }));
+floor.rotation.x = -HALF; floor.position.y = -0.0003; floor.receiveShadow = true; scene.add(floor);
+
+function applyScaleEnv(s) {
+  setShadowRange(4 * Math.pow(s, 0.75));
+  sun.shadow.normalBias = 0.003 * s;
+}
+
+function headWorld(v = _v1) { return camera.getWorldPosition(v); }
+function headYawWorld() { camera.getWorldDirection(_v2); return Math.atan2(-_v2.x, -_v2.z); }
+function headYawLocal() { _v2.set(0, 0, -1).applyQuaternion(camera.quaternion); return Math.atan2(-_v2.x, -_v2.z); }
+
+/* =========================================================
+   TEXT PANELS
+   ========================================================= */
+function textPanel(w, h, draw) {
+  const c = document.createElement('canvas'); c.width = Math.round(w * 1400); c.height = Math.round(h * 1400);
+  draw(c.getContext('2d'), c.width, c.height);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  return new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: t, transparent: true, fog: false }));
+}
+function rr(g, x, y, w, h, r) {
+  g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+const hint = textPanel(0.9, 0.56, (g, W, H) => {
+  rr(g, 6, 6, W - 12, H - 12, 40); g.fillStyle = 'rgba(255,255,255,0.95)'; g.fill(); g.lineWidth = 6; g.strokeStyle = '#d5dae1'; g.stroke();
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = '#22262c'; g.font = '800 64px system-ui, sans-serif'; g.fillText('THE BRICK STUDIO', W / 2, 80);
+  g.fillStyle = '#7a8290'; g.font = '500 30px system-ui, sans-serif'; g.fillText('made by Noah Young.', W / 2, 132);
+  const lines = ['Y (left top button)  —  open the block menu', 'Reach into the menu and grab a block',
+    'Trigger = one block   •   Grip = the whole build', 'Twist your wrist to turn it, let go to snap',
+    'Grip a held build with your other hand to copy it', 'Left stick fly   •   Right stick up/down + turn',
+    'Click the left stick to fly fast   •   Trash bin deletes', 'New: minifigs, Select tool, saved Builds, and Online play'];
+  g.fillStyle = '#353b44'; g.font = '500 36px system-ui, sans-serif';
+  lines.forEach((l, i) => g.fillText(l, W / 2, 200 + i * 70));
+});
+hint.position.set(0, 1.45, -1.3); rig.add(hint);
+
+/* =========================================================
+   HANDS (white, no arms)
+   ========================================================= */
+const HAND_MAT = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5, metalness: 0, emissive: 0x1a1d22 });
+const capsule = (r, len) => { const g = new THREE.CapsuleGeometry(r, Math.max(0.001, len - 2 * r), 4, 8); g.rotateX(HALF); return g; };
+const outlineGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1));
+const hands = [0, 1].map(i => {
+  const grip = renderer.xr.getControllerGrip(i);
+  rig.add(grip);
+  const h = { i, grip, side: null, src: null, model: null, fingers: [], thumb: null, tip: null, grabObj: null,
+    trig: 0, sq: 0, tOn: false, gOn: false, ev: {}, bPrev: [false, false, false], bNow: [false, false, false], held: null, holdBtn: null, hist: [], poke: null,
+    outline: new THREE.LineSegments(outlineGeo, new THREE.LineBasicMaterial({ color: 0x2e8bff, transparent: true, opacity: 0.85 })) };
+  h.outline.visible = false; scene.add(h.outline);
+  grip.addEventListener('connected', e => { h.src = e.data; h.side = e.data.handedness; buildHand(h); });
+  grip.addEventListener('disconnected', () => { if (h.held) placeHeldFromHand(h); h.src = null; if (h.model) { grip.remove(h.model); h.model = null; } });
+  return h;
+});
+function buildHand(h) {
+  if (h.model) h.grip.remove(h.model);
+  const s = h.side === 'left' ? -1 : 1;
+  const root = new THREE.Group();
+  const palm = new THREE.Mesh(new RoundedBoxGeometry(0.026, 0.082, 0.088, 3, 0.011), HAND_MAT);
+  palm.position.set(0.008 * s, -0.005, 0.012); palm.castShadow = true; root.add(palm);
+  const ys = [0.028, 0.009, -0.01, -0.028], l1 = [0.04, 0.044, 0.041, 0.033], l2 = [0.034, 0.037, 0.034, 0.027];
+  h.fingers = [];
+  for (let i = 0; i < 4; i++) {
+    const k = new THREE.Group(); k.position.set(0.006 * s, ys[i] - 0.005, -0.03); root.add(k);
+    const a = new THREE.Mesh(capsule(0.0088, l1[i]), HAND_MAT); a.position.z = -l1[i] / 2; a.castShadow = true; k.add(a);
+    const j = new THREE.Group(); j.position.z = -l1[i]; k.add(j);
+    const b = new THREE.Mesh(capsule(0.0082, l2[i]), HAND_MAT); b.position.z = -l2[i] / 2; b.castShadow = true; j.add(b);
+    const tip = new THREE.Object3D(); tip.position.z = -l2[i] - 0.004; j.add(tip);
+    h.fingers.push({ k, j, tip });
+  }
+  const tk = new THREE.Group(); tk.position.set(-0.004 * s, 0.036, 0.012); tk.rotation.set(0.35, 0.45 * s, 0); root.add(tk);
+  const t1 = new THREE.Mesh(capsule(0.0095, 0.032), HAND_MAT); t1.position.z = -0.016; t1.castShadow = true; tk.add(t1);
+  const tj = new THREE.Group(); tj.position.z = -0.032; tk.add(tj);
+  const t2 = new THREE.Mesh(capsule(0.0088, 0.028), HAND_MAT); t2.position.z = -0.014; t2.castShadow = true; tj.add(t2);
+  h.thumb = { k: tk, j: tj };
+  h.tip = h.fingers[0].tip;
+  h.grabObj = new THREE.Object3D(); h.grabObj.position.set(-0.02 * s, -0.005, -0.045); root.add(h.grabObj);
+  h.sign = s;
+  if (h.side === 'left' && !menu.everOpened) {
+    const lab = textPanel(0.09, 0.034, (g, W, H) => { rr(g, 2, 2, W - 4, H - 4, 18); g.fillStyle = '#2f7cf6'; g.fill(); g.fillStyle = '#fff'; g.font = '700 30px system-ui'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText('Y = Menu', W / 2, H / 2 + 2); });
+    lab.position.set(0, 0.05, 0.02); lab.rotation.x = -0.7; root.add(lab); h.yLabel = lab;
+  }
+  h.model = root; h.grip.add(root);
+}
+function poseHand(h) {
+  if (!h.model) return;
+  const s = h.sign, ti = h.trig, gi = h.sq;
+  h.fingers.forEach((f, i) => { const c = i === 0 ? ti : gi; f.k.rotation.y = s * c * 1.3; f.j.rotation.y = s * c * 1.5; });
+  const tc = Math.max(ti, gi) * 0.6; h.thumb.j.rotation.y = s * tc;
+}
+function buzz(h, i = 0.4, ms = 25) {
+  const a = h && h.src && h.src.gamepad && h.src.gamepad.hapticActuators && h.src.gamepad.hapticActuators[0];
+  if (a) try { a.pulse(i, ms); } catch (e) { }
+}
+
+/* =========================================================
+   TRASH BIN (floats near you)
+   ========================================================= */
+const bin = new THREE.Group(); rig.add(bin);
+(() => {
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.082, 0.18, 28, 1, true), new THREE.MeshStandardMaterial({ color: 0x3b4048, roughness: 0.6, side: THREE.DoubleSide }));
+  const bottom = new THREE.Mesh(new THREE.CircleGeometry(0.082, 28), new THREE.MeshStandardMaterial({ color: 0x2a2e34 }));
+  bottom.rotation.x = -HALF; bottom.position.y = -0.088;
+  bin.userData.rimMat = new THREE.MeshStandardMaterial({ color: 0xe5483d, emissive: 0x000000 });
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(0.1, 0.007, 8, 32), bin.userData.rimMat);
+  rim.rotation.x = HALF; rim.position.y = 0.09;
+  body.castShadow = true; bin.add(body, bottom, rim);
+  const lab = textPanel(0.1, 0.035, (g, W, H) => { g.fillStyle = '#ffffff'; g.font = '800 34px system-ui'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText('TRASH', W / 2, H / 2); });
+  lab.position.set(0, 0.02, 0.102); bin.add(lab);
+})();
+function binContains(p) {
+  if (mode !== 'big' || !bin.visible) return false;
+  const l = bin.worldToLocal(_v4.copy(p));
+  return Math.hypot(l.x, l.z) < 0.12 && l.y > -0.12 && l.y < 0.2;
+}
+function updateBin(dt) {
+  bin.visible = mode === 'big' && !trans;
+  const cl = camera.position, yaw = headYawLocal();
+  const ox = -0.33, oz = -0.22;
+  const tx = cl.x + ox * Math.cos(yaw) + oz * Math.sin(yaw), tz = cl.z - ox * Math.sin(yaw) + oz * Math.cos(yaw);
+  const ty = Math.max(0.12 - rig.position.y, cl.y - 0.78);
+  const k = Math.min(1, dt * 5);
+  bin.position.x += (tx - bin.position.x) * k; bin.position.y += (ty - bin.position.y) * k; bin.position.z += (tz - bin.position.z) * k;
+  bin.rotation.y = yaw;
+  let near = false;
+  for (const h of hands) if (h.held && h.grabObj) { h.grabObj.getWorldPosition(_v3); if (binContains(_v3)) near = true; }
+  bin.userData.rimMat.emissive.setHex(near ? 0xff3b2e : 0x000000);
+}
+
+/* poof particles */
+const poofs = [], poofGeo = new THREE.BoxGeometry(0.012, 0.012, 0.012);
+function poof(pos, hex) {
+  for (let i = 0; i < 14; i++) {
+    const m = new THREE.Mesh(poofGeo, new THREE.MeshBasicMaterial({ color: hex, transparent: true }));
+    m.position.copy(pos);
+    m.userData.v = new THREE.Vector3(Math.random() - 0.5, Math.random() * 0.8 + 0.2, Math.random() - 0.5).multiplyScalar(0.9);
+    m.userData.life = 0.5; scene.add(m); poofs.push(m);
+  }
+}
+
+/* =========================================================
+   MENU (Y button)
+   ========================================================= */
+const MW = 0.56, PTOP = 0.21, PBOT = -0.27, MH = PTOP - PBOT, MK = 1024 / MW, CH = Math.round(MH * MK);
+const menu = { group: new THREE.Group(), miniRoot: new THREE.Group(), figRoot: new THREE.Group(), open: false, tab: 0, hover: null, minis: [],
+  clearArm: 0, everOpened: false, msg: '', msgT: 0, bpArm: -1, bpArmT: 0, entry: null };
+const mCanvas = document.createElement('canvas'); mCanvas.width = 1024; mCanvas.height = CH;
+const mCtx = mCanvas.getContext('2d');
+const mTex = new THREE.CanvasTexture(mCanvas); mTex.colorSpace = THREE.SRGBColorSpace; mTex.anisotropy = 8;
+const mPanelGeo = new THREE.PlaneGeometry(MW, MH); mPanelGeo.translate(0, (PTOP + PBOT) / 2, 0);
+const mPanel = new THREE.Mesh(mPanelGeo, new THREE.MeshBasicMaterial({ map: mTex, transparent: true, fog: false }));
+menu.group.add(mPanel); menu.group.add(menu.miniRoot); menu.group.add(menu.figRoot); menu.group.visible = false; rig.add(menu.group);
+menu.figRoot.position.set(-0.221, 0.005, 0.03); menu.figRoot.scale.setScalar(1.25);
+
+const TAB_NAMES = ['Bricks', 'Plates', 'Slopes', 'House', 'Shapes', 'Home', 'Nature', 'City', 'Fun', 'People', 'Builds', 'Online'];
+const pageOf = t => t < 9 ? 'cat' : t === 9 ? 'people' : t === 10 ? 'builds' : 'online';
+const FIG_ROWS = [['Shirt', 'pal', 0], ['Pants', 'pal', 1], ['Skin', 'skin', 2], ['Hair', 'pal', 3],
+  ['Style', ['None', 'Short', 'Long', 'Cap', 'Helmet', 'Crown'], 4], ['Face', ['Smile', 'Grin', 'Cool', 'Wow'], 5]];
+const FIG_Y = [0.092, 0.058, 0.024, -0.01, -0.05, -0.09];
+const PCOLORS = ['#2f7cf6', '#e5483d', '#2aa148', '#f0a020'];
+const REG = [];
+TAB_NAMES.forEach((n, i) => REG.push({ id: 'tab' + i, kind: 'tab', page: 'all', i, label: n, x0: -0.268 + i * 0.04475, x1: -0.2263 + i * 0.04475, y0: 0.116, y1: 0.152 }));
+for (let k = 0; k < 18; k++) {
+  const c = k % 6, r = Math.floor(k / 6), cx = -0.226 + c * 0.092, cy = 0.072 - r * 0.074;
+  REG.push({ id: 'cell' + k, kind: 'cell', page: 'grid', k, cx, cy, x0: cx - 0.043, x1: cx + 0.043, y0: cy - 0.034, y1: cy + 0.034 });
+  REG.push({ id: 'bpdel' + k, kind: 'bpdel', page: 'builds', k, label: '✕', x0: cx + 0.022, x1: cx + 0.042, y0: cy + 0.014, y1: cy + 0.034 });
+}
+for (let i = 0; i < 16; i++) { const cx = -0.252 + i * 0.0336, cy = -0.135; REG.push({ id: 'col' + i, kind: 'color', page: 'cat', i, cx, cy, x0: cx - 0.0165, x1: cx + 0.0165, y0: cy - 0.0165, y1: cy + 0.0165 }); }
+[['undo', 'Undo', -0.27, -0.207], ['redo', 'Redo', -0.203, -0.14], ['glue', 'Glue', -0.136, -0.058], ['shrink', 'Shrink', -0.054, 0.024], ['prev', '◀', 0.03, 0.058],
+ ['slot', '', 0.06, 0.152, true], ['next', '▶', 0.154, 0.182], ['clear', 'Clear', 0.19, 0.27]]
+  .forEach(([id, label, x0, x1, lab]) => REG.push({ id, kind: lab ? 'label' : 'tool', page: 'all', label, x0, x1, y0: -0.203, y1: -0.163 }));
+[['select', 'Select', -0.27, -0.19], ['copy', 'Copy', -0.185, -0.115], ['del', 'Delete', -0.11, -0.03], ['save', 'Save', -0.025, 0.045],
+ ['x2', '2x', 0.05, 0.105], ['half', '½x', 0.11, 0.165]]
+  .forEach(([id, label, x0, x1]) => REG.push({ id, kind: 'sel', page: 'all', label, x0, x1, y0: -0.255, y1: -0.215 }));
+REG.push({ id: 'selinfo', kind: 'selinfo', page: 'all', x0: 0.17, x1: 0.27, y0: -0.255, y1: -0.215 });
+FIG_ROWS.forEach(([, kind, idx], ri) => {
+  const y = FIG_Y[ri];
+  if (kind === 'pal' || kind === 'skin') {
+    const n = kind === 'pal' ? 16 : SKIN.length;
+    for (let i = 0; i < n; i++) { const cx = -0.11 + i * 0.0242; REG.push({ id: 'fc' + idx + '_' + i, kind: 'figc', page: 'people', idx, val: i, skin: kind === 'skin', cx, cy: y, x0: cx - 0.011, x1: cx + 0.011, y0: y - 0.011, y1: y + 0.011 }); }
+  } else {
+    const w = 0.38 / kind.length;
+    kind.forEach((label, i) => REG.push({ id: 'fo' + idx + '_' + i, kind: 'figo', page: 'people', idx, val: i, label, x0: -0.122 + i * w, x1: -0.122 + (i + 1) * w - 0.005, y0: y - 0.016, y1: y + 0.016 }));
+  }
+});
+[['host', 'Host', -0.27, -0.18], ['join', 'Join', -0.175, -0.085], ['leave', 'Leave', -0.08, 0.01], ['mic', 'Mic', 0.015, 0.115]]
+  .forEach(([id, label, x0, x1]) => REG.push({ id, kind: 'net', page: 'online', label, x0, x1, y0: 0.022, y1: 0.058 }));
+[['1', '2', '3'], ['4', '5', '6'], ['7', '8', '9'], ['⌫', '0', 'Go']].forEach((row, ri) => row.forEach((label, ci) => {
+  const cx = 0.152 + ci * 0.048, cy = 0.05 - ri * 0.045;
+  REG.push({ id: 'key' + label, kind: 'key', page: 'online', label, x0: cx - 0.021, x1: cx + 0.021, y0: cy - 0.019, y1: cy + 0.019 });
+}));
+
+const mx = x => (x + MW / 2) * MK, my = y => (PTOP - y) * MK;
+const hexCss = h => '#' + h.toString(16).padStart(6, '0');
+function regActive(R) {
+  const pg = pageOf(menu.tab);
+  if (R.page === 'all') return true;
+  if (R.page === 'grid') return pg === 'cat' || pg === 'builds';
+  if (R.kind === 'key') return pg === 'online' && menu.entry !== null;
+  return R.page === pg;
+}
+function catItems() { return menu.tab < 9 ? TYPES.filter(t => t.cat === CATS[menu.tab]) : []; }
+function btn(g, R, label, fill, color, font) {
+  const x = mx(R.x0), y = my(R.y1), w = mx(R.x1) - x, h = my(R.y0) - y;
+  rr(g, x, y, w, h, 12); g.fillStyle = fill; g.fill();
+  g.fillStyle = color; g.font = font || '700 21px system-ui'; g.textAlign = 'center'; g.fillText(label, x + w / 2, y + h / 2 + 1);
+}
+function netStatusText() {
+  if (NET.role === 'host') return `Hosting  ·  code ${NET.code}  ·  ${NET.conns.length + 1}/4 players`;
+  if (NET.role === 'guest') return `In world ${NET.code}  ·  ${NET.players.size + 1} players`;
+  return NET.status;
+}
+function drawMenu() {
+  const g = mCtx; g.clearRect(0, 0, 1024, CH);
+  rr(g, 4, 4, 1016, CH - 8, 34); g.fillStyle = 'rgba(250,251,253,0.97)'; g.fill(); g.lineWidth = 4; g.strokeStyle = '#d5dae1'; g.stroke();
+  g.textBaseline = 'middle';
+  g.fillStyle = '#22262c'; g.font = '800 34px system-ui, sans-serif'; g.textAlign = 'left'; g.fillText('THE BRICK STUDIO', mx(-0.262), my(0.186));
+  if (menu.msgT > 0) {
+    g.font = '700 20px system-ui'; const w = g.measureText(menu.msg).width + 36;
+    rr(g, mx(0.262) - w, my(0.2), w, 0.028 * MK, 16); g.fillStyle = '#fff1d6'; g.fill();
+    g.fillStyle = '#9a5a00'; g.textAlign = 'right'; g.fillText(menu.msg, mx(0.262) - 18, my(0.186));
+  } else { g.fillStyle = '#7a8290'; g.font = '500 20px system-ui, sans-serif'; g.textAlign = 'right'; g.fillText('made by Noah Young.', mx(0.262), my(0.186)); }
+  const pg = pageOf(menu.tab), small = mode !== 'big', items = catItems(), guest = NET.role === 'guest';
+  for (const R of REG) {
+    if (!regActive(R)) continue;
+    const x = mx(R.x0), y = my(R.y1), w = mx(R.x1) - x, h = my(R.y0) - y, hov = menu.hover === R.id;
+    switch (R.kind) {
+      case 'tab':
+        btn(g, R, R.label, menu.tab === R.i ? '#2f7cf6' : hov ? '#dde4ee' : '#eef1f5', menu.tab === R.i ? '#ffffff' : '#2a2f36', '700 15px system-ui'); break;
+      case 'cell': {
+        const n = pg === 'cat' ? items.length : blueprints.length;
+        if (small || R.k >= n) break;
+        rr(g, x, y, w, h, 14); g.fillStyle = '#f0f3f7'; g.fill();
+        g.fillStyle = '#4a515c'; g.font = '600 17px system-ui'; g.textAlign = 'center';
+        g.fillText(pg === 'cat' ? items[R.k].name : blueprints[R.k].name, mx(R.cx), my(R.cy - 0.027)); break;
+      }
+      case 'bpdel':
+        if (small || R.k >= blueprints.length) break;
+        btn(g, R, menu.bpArm === R.k ? '?' : '✕', menu.bpArm === R.k ? '#e5483d' : hov ? '#d3d9e2' : '#e3e7ed', menu.bpArm === R.k ? '#fff' : '#5a6270', '700 16px system-ui'); break;
+      case 'color':
+        g.globalAlpha = small ? 0.35 : 1;
+        g.beginPath(); g.arc(mx(R.cx), my(R.cy), 0.0125 * MK, 0, Math.PI * 2); g.fillStyle = hexCss(PALETTE[R.i]); g.fill();
+        g.lineWidth = 2; g.strokeStyle = 'rgba(0,0,0,0.18)'; g.stroke();
+        if (curColor === R.i) { g.beginPath(); g.arc(mx(R.cx), my(R.cy), 0.0158 * MK, 0, Math.PI * 2); g.lineWidth = 5; g.strokeStyle = '#2f7cf6'; g.stroke(); }
+        g.globalAlpha = 1; break;
+      case 'tool': {
+        const isClear = R.id === 'clear' && menu.clearArm > 0, isShrink = R.id === 'shrink', isGlue = R.id === 'glue' && glueMode;
+        g.globalAlpha = guest && (R.id === 'prev' || R.id === 'next' || R.id === 'clear') ? 0.35 : 1;
+        const lab = R.id === 'shrink' ? (mode === 'big' ? 'Shrink' : 'Grow') : R.id === 'clear' ? (menu.clearArm > 0 ? 'Sure?' : 'Clear') : R.id === 'glue' ? (glueMode ? 'Glue ON' : 'Glue') : R.label;
+        btn(g, R, lab, isClear ? '#e5483d' : isGlue ? '#f0a020' : isShrink ? (hov ? '#1f6ae0' : '#2f7cf6') : hov ? '#dde4ee' : '#eef1f5',
+          (isClear || isShrink || isGlue) ? '#ffffff' : '#2a2f36', '700 21px system-ui');
+        g.globalAlpha = 1; break;
+      }
+      case 'label':
+        g.fillStyle = '#2a2f36'; g.font = '700 20px system-ui'; g.textAlign = 'center';
+        g.fillText(guest ? 'Visiting' : 'World ' + slot, x + w / 2, y + h / 2 - 8);
+        g.fillStyle = '#7a8290'; g.font = '500 15px system-ui'; g.fillText(world.bricks.size + ' bricks', x + w / 2, y + h / 2 + 12); break;
+      case 'sel': {
+        const isSel = R.id === 'select';
+        g.globalAlpha = (small || (!isSel && !sel)) ? 0.35 : 1;
+        btn(g, R, isSel ? (selMode ? 'Select ON' : 'Select') : R.label, isSel && selMode ? '#10a37f' : hov ? '#dde4ee' : '#eef1f5', isSel && selMode ? '#ffffff' : '#2a2f36', '700 19px system-ui');
+        g.globalAlpha = 1; break;
+      }
+      case 'selinfo':
+        g.fillStyle = '#5a6270'; g.font = '600 16px system-ui'; g.textAlign = 'center';
+        g.fillText(sel ? sel.ids.size + ' selected' : selMode ? 'Trigger: drag a box' : '', x + w / 2, y + h / 2); break;
+      case 'figc':
+        g.beginPath(); g.arc(mx(R.cx), my(R.cy), 0.0095 * MK, 0, Math.PI * 2); g.fillStyle = hexCss(R.skin ? SKIN[R.val] : PALETTE[R.val]); g.fill();
+        g.lineWidth = 2; g.strokeStyle = 'rgba(0,0,0,0.18)'; g.stroke();
+        if (FIG[R.idx] === R.val) { g.beginPath(); g.arc(mx(R.cx), my(R.cy), 0.0122 * MK, 0, Math.PI * 2); g.lineWidth = 4; g.strokeStyle = '#2f7cf6'; g.stroke(); }
+        break;
+      case 'figo':
+        btn(g, R, R.label, FIG[R.idx] === R.val ? '#2f7cf6' : hov ? '#dde4ee' : '#eef1f5', FIG[R.idx] === R.val ? '#ffffff' : '#2a2f36', '700 16px system-ui'); break;
+      case 'net': {
+        const off = (R.id === 'host' && NET.role) || (R.id === 'join' && NET.role) || ((R.id === 'leave' || R.id === 'mic') && !NET.role);
+        const lab = R.id === 'join' && menu.entry !== null ? 'Cancel' : R.id === 'mic' ? (NET.muted ? 'Mic OFF' : 'Mic ON') : R.label;
+        g.globalAlpha = off ? 0.35 : 1;
+        btn(g, R, lab, R.id === 'mic' && NET.muted && NET.role ? '#e5483d' : hov ? '#dde4ee' : '#eef1f5', R.id === 'mic' && NET.muted && NET.role ? '#fff' : '#2a2f36', '700 19px system-ui');
+        g.globalAlpha = 1; break;
+      }
+      case 'key':
+        btn(g, R, R.label, R.label === 'Go' ? '#2f7cf6' : hov ? '#dde4ee' : '#eef1f5', R.label === 'Go' ? '#fff' : '#2a2f36', '700 22px system-ui'); break;
+    }
+  }
+  g.textAlign = 'center';
+  if (small && (pg === 'cat' || pg === 'builds')) {
+    g.fillStyle = '#2a2f36'; g.font = '800 32px system-ui'; g.fillText('Explore mode', mx(0), my(0.03));
+    g.fillStyle = '#5a6270'; g.font = '500 22px system-ui';
+    g.fillText('Walk with the left stick, jump with A, open doors with trigger.', mx(0), my(-0.01));
+    g.fillText('Press GROW to build again.', mx(0), my(-0.045));
+  } else if (pg === 'builds' && !blueprints.length) {
+    g.fillStyle = '#5a6270'; g.font = '600 22px system-ui';
+    g.fillText('No saved builds yet.', mx(0), my(0.03));
+    g.fillText('Turn on Select, drag a box around a build, then press Save.', mx(0), my(-0.01));
+  }
+  if (pg === 'people') {
+    rr(g, mx(-0.27), my(0.11), 0.098 * MK, 0.22 * MK, 16); g.fillStyle = '#f0f3f7'; g.fill();
+    g.fillStyle = '#4a515c'; g.font = '600 15px system-ui'; g.fillText('Grab to place', mx(-0.221), my(-0.1));
+    g.textAlign = 'left'; g.font = '700 15px system-ui';
+    FIG_ROWS.forEach(([lab], i) => g.fillText(lab, mx(-0.166), my(FIG_Y[i])));
+    g.fillStyle = '#7a8290'; g.font = '500 15px system-ui';
+    g.fillText('This is also how you look in shrink mode and to friends online.', mx(-0.166), my(-0.125));
+  }
+  if (pg === 'online') {
+    g.textAlign = 'left'; g.fillStyle = '#22262c'; g.font = '700 22px system-ui'; g.fillText(netStatusText(), mx(-0.268), my(0.09));
+    g.font = '600 19px system-ui';
+    if (NET.role) {
+      const list = [{ slot: NET.slot, me: true }, ...[...NET.players.keys()].map(s => ({ slot: s }))].sort((a, b) => a.slot - b.slot);
+      list.forEach((p, i) => {
+        const yy = my(-0.005 - i * 0.03);
+        g.fillStyle = PCOLORS[p.slot] || '#555'; g.beginPath(); g.arc(mx(-0.26), yy, 8, 0, Math.PI * 2); g.fill();
+        g.fillStyle = '#2a2f36'; g.fillText('Player ' + (p.slot + 1) + (p.me ? ' (you)' : '') + (p.slot === 0 ? '  ·  host' : ''), mx(-0.25), yy);
+      });
+    } else {
+      g.fillStyle = '#4a515c';
+      ['Host: open your world so friends can join.', 'Join: type a friend\'s 5-digit code.', 'Up to 4 players, with voice chat.']
+        .forEach((l, i) => g.fillText(l, mx(-0.268), my(-0.005 - i * 0.032)));
+    }
+    if (menu.entry !== null) {
+      rr(g, mx(0.128), my(0.108), 0.144 * MK, 0.032 * MK, 10); g.fillStyle = '#ffffff'; g.fill(); g.lineWidth = 3; g.strokeStyle = '#2f7cf6'; g.stroke();
+      g.fillStyle = '#22262c'; g.font = '800 26px system-ui'; g.textAlign = 'center';
+      g.fillText((menu.entry + '_____').slice(0, 5).split('').join(' '), mx(0.2), my(0.092));
+    }
+  }
+  mTex.needsUpdate = true;
+}
+function buildMini(t) {
+  const g = new THREE.Group(), inner = new THREE.Group(); g.add(inner);
+  for (const p of t.parts) {
+    let m;
+    if (p.mat === 'glow') m = MAT.glow;
+    else { m = MAT[p.mat].clone(); m.userData.tint = p.tint; tintColor(PALETTE[curColor], p.tint, m.color); }
+    inner.add(new THREE.Mesh(p.g, m));
+  }
+  const W = t.w * P, H = t.h * PH, D = t.d * P;
+  inner.position.set(-W / 2, -H / 2, -D / 2);
+  g.scale.setScalar(Math.min(1.5, 0.05 / Math.max(W, H, D)));
+  return g;
+}
+function buildBPMini(bp) {
+  const g = new THREE.Group(), inner = new THREE.Group(); g.add(inner);
+  const batch = new BatchSet(inner, 'normal'), st = bpStates(bp);
+  let id = -1; for (const s of st) { s.id = id--; batch.add(s); }
+  const e = st.length ? statesBox(st) : { x0: 0, x1: 1, y0: 0, y1: 1, z0: 0, z1: 1 };
+  const W = (e.x1 - e.x0) * P, H = (e.y1 - e.y0) * PH, D = (e.z1 - e.z0) * P;
+  inner.position.set(-(e.x0 * P + W / 2), -(e.y0 * PH + H / 2), -(e.z0 * P + D / 2));
+  g.scale.setScalar(Math.min(1.5, 0.05 / Math.max(W, H, D, 0.001)));
+  return { g, batch };
+}
+function clearMinis() {
+  for (const m of menu.minis) {
+    menu.miniRoot.remove(m.g);
+    if (m.batch) m.batch.dispose();
+    else m.g.traverse(o => { if (o.isMesh && o.material && o.material !== MAT.glow) o.material.dispose(); });
+  }
+  menu.minis = [];
+}
+function rebuildMinis() {
+  clearMinis();
+  menu.miniRoot.visible = mode === 'big';
+  const pg = pageOf(menu.tab);
+  if (pg === 'cat') catItems().forEach((t, k) => {
+    const R = REG.find(r => r.id === 'cell' + k); if (!R) return;
+    const g = buildMini(t); g.position.set(R.cx, R.cy + 0.006, 0.032); g.userData.base = g.scale.x;
+    menu.miniRoot.add(g); menu.minis.push({ g, t, spin: k * 0.7 });
+  });
+  else if (pg === 'builds') blueprints.forEach((bp, k) => {
+    const R = REG.find(r => r.id === 'cell' + k); if (!R) return;
+    const m = buildBPMini(bp); m.g.position.set(R.cx, R.cy + 0.006, 0.032); m.g.userData.base = m.g.scale.x;
+    menu.miniRoot.add(m.g); menu.minis.push({ g: m.g, batch: m.batch, bp, spin: k * 0.7 });
+  });
+  rebuildFigPreview();
+}
+function recolorMinis() {
+  for (const m of menu.minis) m.g.traverse(o => { if (o.material && o.material.userData && o.material.userData.tint !== undefined) tintColor(PALETTE[curColor], o.material.userData.tint, o.material.color); });
+}
+function rebuildFigPreview() {
+  for (const c of [...menu.figRoot.children]) { menu.figRoot.remove(c); disposeFig(c); }
+  if (pageOf(menu.tab) !== 'people') return;
+  const g = buildFigGroup([...FIG, 0, 0.35, -0.35, 0, 0]); g.position.set(-P, -0.072, -0.5 * P);
+  menu.figRoot.add(g);
+}
+function toggleMenu() {
+  menu.open = !menu.open; menu.group.visible = menu.open; sMenu(menu.open);
+  if (!menu.open) { menu.clearArm = 0; menu.entry = null; return; }
+  const cl = camera.position, yaw = headYawLocal();
+  menu.group.position.set(cl.x - Math.sin(yaw) * 0.42, cl.y - 0.27, cl.z - Math.cos(yaw) * 0.42);
+  _m.lookAt(cl, menu.group.position, UP); menu.group.quaternion.setFromRotationMatrix(_m);
+  if (!menu.everOpened) { menu.everOpened = true; hint.visible = false; for (const h of hands) if (h.yLabel) h.yLabel.visible = false; }
+  drawMenu();
+}
+function pressRegion(R) {
+  sTick(0.2);
+  const big = mode === 'big';
+  switch (R.kind) {
+    case 'tab': menu.tab = R.i; menu.entry = null; rebuildMinis(); break;
+    case 'color': if (big) { curColor = R.i; recolorMinis(); } break;
+    case 'tool':
+      if (R.id === 'glue') { if (big) glueMode = !glueMode; }
+      else if (R.id === 'undo') undo();
+      else if (R.id === 'redo') redo();
+      else if (R.id === 'shrink') setMode(big ? 'small' : 'big');
+      else if (R.id === 'prev') switchSlot(-1);
+      else if (R.id === 'next') switchSlot(1);
+      else if (R.id === 'clear') {
+        if (NET.role === 'guest') flash('Only the host can clear the world');
+        else if (menu.clearArm > 0) { clearWorld(); menu.clearArm = 0; } else menu.clearArm = 3;
+      }
+      break;
+    case 'sel': selAction(R.id); break;
+    case 'bpdel':
+      if (R.k >= blueprints.length) break;
+      if (menu.bpArm === R.k) { blueprints.splice(R.k, 1); saveBPs(); menu.bpArm = -1; rebuildMinis(); }
+      else { menu.bpArm = R.k; menu.bpArmT = 3; }
+      break;
+    case 'figc': case 'figo': FIG[R.idx] = R.val; saveFig(); rebuildFigPreview(); break;
+    case 'net': netButton(R.id); break;
+    case 'key': keyPress(R.label); break;
+  }
+  drawMenu();
+}
+function pokeCheck(h) {
+  if (!menu.open || !h.tip) { h.poke = null; return null; }
+  h.tip.getWorldPosition(_v1); menu.group.worldToLocal(_v1);
+  const x = _v1.x, y = _v1.y, z = _v1.z;
+  let hit = null;
+  if (z > -0.04 && z < 0.05 && Math.abs(x) < MW / 2 && y < PTOP && y > PBOT)
+    for (const R of REG) {
+      if (R.kind === 'cell' || R.kind === 'label' || R.kind === 'selinfo' || !regActive(R)) continue;
+      if (x >= R.x0 && x <= R.x1 && y >= R.y0 && y <= R.y1) { hit = R; break; }
+    }
+  if (hit && z < 0.01) { if (h.poke !== hit.id) { h.poke = hit.id; pressRegion(hit); buzz(h, 0.35, 15); } }
+  else if (!hit || z > 0.025) h.poke = null;
+  return hit ? hit.id : null;
+}
+
+/* =========================================================
+   HOLDING, GHOST PREVIEW, SNAPPING
+   ========================================================= */
+function rotPt(x, z, R) { for (let i = 0; i < R; i++) { const nx = z, nz = -x; x = nx; z = nz; } return [x, z]; }
+function makeHeld(states, anchor, keepIds) {
+  const g = new THREE.Group(); scene.add(g);
+  g.position.set(anchor.x * P, anchor.y * PH, anchor.z * P);
+  const rel = states.map(s => { const o = { id: keepIds ? s.id : tmpId--, t: s.t, c: s.c, x: s.x - anchor.x, y: s.y - anchor.y, z: s.z - anchor.z, r: s.r }; if (s.f) o.f = s.f.slice(); return o; });
+  const batch = new BatchSet(g, 'normal'); rel.forEach(b => batch.add(b));
+  const gg = new THREE.Group(); gg.visible = false; scene.add(gg);
+  const gb = new BatchSet(gg, 'ghost'); rel.forEach(b => gb.add(b));
+  const H = { bricks: rel, originals: keepIds ? states : [], keepIds, group: g, batch, ghostGroup: gg, ghostBatch: gb, rc: [], sol: null, ck: '', glueBefore: [], glueInt: [] };
+  const all = heldCells(H, 0).all; const c = new THREE.Vector3();
+  for (const q of all) c.x += (q.x + 0.5) * P, c.y += (q.y + 0.5) * PH, c.z += (q.z + 0.5) * P;
+  H.centerLocal = c.divideScalar(Math.max(1, all.length));
+  return H;
+}
+function heldCells(H, R) {
+  if (!H.rc[R]) {
+    const out = [];
+    for (const b of H.bricks) {
+      const t = TYPES[b.t], rr2 = (b.r + R) % 4, [ox, oz] = rotPt(b.x, b.z, R);
+      for (const c of t.rc[rr2]) out.push({ x: c.x + ox, y: c.y + b.y, z: c.z + oz, top: c.top, bot: c.bot });
+    }
+    const set = new Set(out.map(c => _key(c.x, c.y, c.z)));
+    H.rc[R] = { all: out, bots: out.filter(c => c.bot && !set.has(_key(c.x, c.y - 1, c.z))), tops: out.filter(c => c.top && !set.has(_key(c.x, c.y + 1, c.z))) };
+  }
+  return H.rc[R];
+}
+function heldCenter(H) { return H.group.localToWorld(H.centerLocal.clone()); }
+function fits(cells, X, Y, Z) {
+  for (const c of cells) { const y = c.y + Y; if (y < 0) return false; if (world.occ.has(_key(c.x + X, y, c.z + Z))) return false; }
+  return true;
+}
+function connects(rc, X, Y, Z) {
+  for (const c of rc.bots) { const y = c.y + Y; if (y === 0) return true; const e = world.occ.get(_key(c.x + X, y - 1, c.z + Z)); if (e && e.top) return true; }
+  for (const c of rc.tops) { const e = world.occ.get(_key(c.x + X, c.y + Y + 1, c.z + Z)); if (e && e.bot) return true; }
+  return false;
+}
+function touches(rc, X, Y, Z) {
+  for (const c of rc.all) for (const d of NB6) if (world.occ.has(_key(c.x + X + d[0], c.y + Y + d[1], c.z + Z + d[2]))) return true;
+  return false;
+}
+// find where a held piece lands: studs first, then flush against sides (magnet), else float
+function solve(H, pos, R) {
+  const rc = heldCells(H, R), gx = pos.x / P, gy = pos.y / PH, gz = pos.z / P;
+  const X0 = Math.round(gx), Y0 = Math.round(gy), Z0 = Math.round(gz);
+  const n = rc.all.length, big = n > 400, mag = n <= 150;
+  const rxz = big ? 0 : (n <= 60 ? 2 : 1), ry = big ? 1 : 3;
+  let best = null, bs = Infinity;
+  for (let dy = -ry; dy <= ry; dy++) for (let dx = -rxz; dx <= rxz; dx++) for (let dz = -rxz; dz <= rxz; dz++) {
+    const X = X0 + dx, Y = Y0 + dy, Z = Z0 + dz;
+    if (!fits(rc.all, X, Y, Z)) continue;
+    let kind;
+    if (connects(rc, X, Y, Z)) kind = 1; else if (mag && touches(rc, X, Y, Z)) kind = 2; else continue;
+    const d = ((X - gx) * P) ** 2 + ((Y - gy) * PH) ** 2 + ((Z - gz) * P) ** 2 + (kind === 2 ? 0.00012 : 0);
+    if (d < bs) { bs = d; best = { x: X, y: Y, z: Z, R, conn: kind === 1, mag: kind === 2 }; }
+  }
+  if (best) return best;
+  if (fits(rc.all, X0, Y0, Z0)) return { x: X0, y: Y0, z: Z0, R, conn: false, mag: false };
+  for (let up = 1; up < 300; up++) if (fits(rc.all, X0, Y0 + up, Z0)) return { x: X0, y: Y0 + up, z: Z0, R, conn: connects(rc, X0, Y0 + up, Z0), mag: false };
+  return null;
+}
+function groupPose(g, out) {
+  g.updateWorldMatrix(true, false);
+  out.setFromMatrixPosition(g.matrixWorld);
+  g.getWorldQuaternion(_q);
+  _v2.set(1, 0, 0).applyQuaternion(_q);
+  let yaw;
+  if (Math.hypot(_v2.x, _v2.z) > 0.35) yaw = Math.atan2(-_v2.z, _v2.x);
+  else { _v2.set(0, 0, 1).applyQuaternion(_q); yaw = Math.atan2(_v2.x, _v2.z); }
+  return ((Math.round(yaw / HALF) % 4) + 4) % 4;
+}
+function updateGhost(h) {
+  const H = h.held, R = groupPose(H.group, _v3);
+  const key = Math.round(_v3.x / P) + ',' + Math.round(_v3.y / PH) + ',' + Math.round(_v3.z / P) + ',' + R + ',' + worldVer;
+  if (key !== H.ck) {
+    H.ck = key; const prev = H.sol;
+    H.sol = solve(H, _v3, R);
+    const s = H.sol;
+    if (s && (s.conn || s.mag) && (!prev || prev.x !== s.x || prev.y !== s.y || prev.z !== s.z || prev.R !== s.R)) { buzz(h, 0.12, 8); sTick(0.05); }
+  }
+  h.grabObj.getWorldPosition(_v4);
+  const s = H.sol, inBin = binContains(_v4);
+  H.ghostGroup.visible = !!s && !inBin;
+  if (s) { H.ghostGroup.position.set(s.x * P, s.y * PH, s.z * P); H.ghostGroup.rotation.set(0, s.R * HALF, 0); H.ghostBatch.mat.color.setHex(s.conn ? 0x3d9bff : s.mag ? (glueMode ? 0xffaa22 : 0x19c2c2) : 0x9aa3ad); }
+}
+function disposeHeld(H) {
+  if (H.netKey) { sendAll({ t: 'drop', slot: NET.slot, key: H.netKey }); H.netKey = 0; }
+  if (H.group.parent) H.group.parent.remove(H.group);
+  if (H.ghostGroup.parent) H.ghostGroup.parent.remove(H.ghostGroup);
+  H.batch.dispose(); H.ghostBatch.dispose();
+}
+function commitHeld(H, sol) {
+  const added = [], map = new Map();
+  for (const b of H.bricks) {
+    const [ox, oz] = rotPt(b.x, b.z, sol.R);
+    const nb = world.add({ id: H.keepIds ? b.id : 0, t: b.t, c: b.c, x: sol.x + ox, y: sol.y + b.y, z: sol.z + oz, r: (b.r + sol.R) % 4, f: b.f });
+    added.push(strip(nb)); map.set(b.id, nb.id);
+  }
+  for (const [a, b] of H.glueInt) world.addGlue(map.get(a), map.get(b));
+  const ids = added.map(x => x.id);
+  if (glueMode) { const set = new Set(ids); for (const id of ids) for (const o of world.touchPairs(id)) if (!set.has(o)) world.addGlue(id, o); }
+  pushUndo({ removed: H.originals, added, gb: H.glueBefore, ga: world.linksOf(ids) });
+}
+function placeHeld(H) {
+  scene.attach(H.group);
+  const R = groupPose(H.group, _v3);
+  const sol = solve(H, _v3, R);
+  if (sol) commitHeld(H, sol);
+  else if (H.originals.length) { for (const s of H.originals) world.add(s); for (const [a, b] of H.glueBefore) world.addGlue(a, b); }
+  disposeHeld(H); sClick();
+}
+function trashHeld(H) {
+  const c = heldCenter(H);
+  if (H.originals.length) pushUndo({ removed: H.originals, added: [], gb: H.glueBefore, ga: [] });
+  poof(c, PALETTE[H.bricks[0].c]); disposeHeld(H); sTrash();
+}
+function attachHeld(h, H, how) {
+  H.group.updateMatrixWorld(true);
+  h.grip.attach(H.group); h.held = H; h.holdBtn = how;
+  if (NET.role) { H.netKey = (NET.slot + 1) * 1e6 + (++netKey); sendAll({ t: 'hold', slot: NET.slot, key: H.netKey, b: H.bricks.map(encS) }); }
+}
+function nearHeld(H, gp, rad) {
+  const l = H.group.worldToLocal(gp.clone());
+  for (const c of heldCells(H, 0).all) {
+    const dx = Math.max(c.x * P - l.x, 0, l.x - (c.x + 1) * P), dy = Math.max(c.y * PH - l.y, 0, l.y - (c.y + 1) * PH), dz = Math.max(c.z * P - l.z, 0, l.z - (c.z + 1) * P);
+    if (dx * dx + dy * dy + dz * dz < rad * rad) return true;
+  }
+  return false;
+}
+function tryGrab(h, how) {
+  if (!h.grabObj) return;
+  const gp = h.grabObj.getWorldPosition(new THREE.Vector3());
+  const sc = rig.scale.x;
+  if (mode !== 'big') { // explorer: doors only
+    const id = world.nearest(gp, 0.6 * P, b => TYPES[b.t].door);
+    if (id) { toggleDoor(id); buzz(h, 0.3, 20); }
+    return;
+  }
+  if (menu.open) { // reach into the menu
+    if (pageOf(menu.tab) === 'people' && menu.figRoot.children.length) {
+      menu.figRoot.getWorldPosition(_v1);
+      if (_v1.distanceTo(gp) < 0.075 * sc) { spawnHeld(h, T.fig, gp, how, [...FIG, 0, 0, 0, 0, 0]); return; }
+    }
+    let best = null, bd = (0.042 * sc) ** 2;
+    for (const m of menu.minis) { m.g.getWorldPosition(_v1); const d = _v1.distanceToSquared(gp); if (d < bd) { bd = d; best = m; } }
+    if (best) { if (best.bp) spawnBlueprint(h, best.bp, gp, how); else spawnHeld(h, best.t, gp, how); return; }
+  }
+  if (selMode && how === 'trig') { startSelDrag(h, gp); return; }
+  if (selMode && how === 'grip' && sel && grabSelection(h, gp)) return;
+  const o = hands.find(x => x !== h && x.held);
+  if (o && how === 'grip' && nearHeld(o.held, gp, 0.05)) { duplicateHeld(h, o.held); return; }
+  const limb = figLimbAt(gp);
+  if (limb) { h.posing = { ...limb, btn: how }; buzz(h, 0.3, 15); sTick(0.1); return; }
+  const id = world.nearest(gp, 0.05);
+  if (!id) return;
+  grabIds(h, how === 'grip' ? world.component(id) : [id], how);
+}
+function spawnHeld(h, t, gp, how, f) {
+  const s = { id: 0, t: t.idx, c: curColor, x: 0, y: 0, z: 0, r: 0 }; if (f) s.f = f;
+  const H = makeHeld([s], { x: 0, y: 0, z: 0 }, false);
+  H.group.quaternion.setFromAxisAngle(UP, headYawWorld());
+  const c = new THREE.Vector3(t.w * P / 2, t.h * PH / 2, t.d * P / 2).applyQuaternion(H.group.quaternion);
+  H.group.position.copy(gp).sub(c);
+  attachHeld(h, H, how); sPop(); buzz(h, 0.5, 25);
+}
+function duplicateHeld(h, O) {
+  const H = makeHeld(O.bricks.map(b => ({ ...b })), { x: 0, y: 0, z: 0 }, false);
+  const idm = new Map(O.bricks.map((b, i) => [b.id, H.bricks[i].id]));
+  H.glueInt = (O.glueInt || []).map(([a, b]) => [idm.get(a), idm.get(b)]);
+  O.group.updateWorldMatrix(true, false);
+  O.group.matrixWorld.decompose(H.group.position, H.group.quaternion, H.group.scale);
+  attachHeld(h, H, 'grip'); sPop(); buzz(h, 0.6, 30); buzz(O.hand || hands.find(x => x.held === O), 0.3, 20);
+}
+function releaseHand(h) {
+  const H = h.held; if (!H) return;
+  h.held = null; h.holdBtn = null;
+  const gp = h.grabObj.getWorldPosition(new THREE.Vector3());
+  scene.attach(H.group);
+  if (mode === 'big' && (binContains(gp) || binContains(heldCenter(H)))) { trashHeld(H); buzz(h, 0.5, 40); return; }
+  const vl = handVel(h);
+  if (mode === 'big' && vl.length() > 1.7) {
+    H.vel = vl.applyQuaternion(rig.quaternion).multiplyScalar(rig.scale.x);
+    H.ghostGroup.visible = false; thrown.push(H); sWhoosh(); return;
+  }
+  placeHeld(H); buzz(h, 0.6, 30);
+}
+function placeHeldFromHand(h) { const H = h.held; if (!H) return; h.held = null; h.holdBtn = null; placeHeld(H); }
+function dropEverything() {
+  for (const h of hands) if (h.held) placeHeldFromHand(h);
+  while (thrown.length) placeHeld(thrown.pop());
+}
+const anyHeld = () => hands.some(h => h.held) || thrown.length > 0;
+function updateThrown(dt) {
+  for (let i = thrown.length - 1; i >= 0; i--) {
+    const H = thrown[i];
+    H.group.position.addScaledVector(H.vel, dt);
+    H.vel.multiplyScalar(Math.exp(-2.4 * dt));
+    const c = heldCenter(H);
+    if (bin.visible) {
+      bin.getWorldPosition(_v4); const d = _v4.sub(c), dist = d.length();
+      if (dist < 0.7) H.vel.addScaledVector(d.normalize(), 7 * dt);
+      if (binContains(c)) { thrown.splice(i, 1); trashHeld(H); continue; }
+    }
+    if (H.vel.length() < 0.12) { thrown.splice(i, 1); placeHeld(H); }
+  }
+}
+function trackHand(h, now) {
+  if (!h.grabObj) return;
+  h.grabObj.getWorldPosition(_v1); rig.worldToLocal(_v1);
+  h.hist.push({ t: now, p: _v1.clone() }); while (h.hist.length > 8) h.hist.shift();
+}
+function handVel(h) {
+  const H = h.hist; if (H.length < 2) return new THREE.Vector3();
+  const a = H[Math.max(0, H.length - 6)], b = H[H.length - 1], dt = b.t - a.t;
+  return dt > 0 ? b.p.clone().sub(a.p).divideScalar(dt) : new THREE.Vector3();
+}
+function updateOutline(h) {
+  const o = h.outline;
+  if (h.held || !h.grabObj || trans) { o.visible = false; return; }
+  h.grabObj.getWorldPosition(_v1);
+  const id = mode === 'big' ? world.nearest(_v1, 0.05) : world.nearest(_v1, 0.6 * P, b => TYPES[b.t].door);
+  if (!id) { o.visible = false; return; }
+  const b = world.bricks.get(id), bb = TYPES[b.t].bb[b.r], pad = 0.002 * rig.scale.x;
+  o.visible = true;
+  o.position.set((b.x + (bb.x0 + bb.x1) / 2) * P, (b.y + (bb.y0 + bb.y1) / 2) * PH, (b.z + (bb.z0 + bb.z1) / 2) * P);
+  o.scale.set((bb.x1 - bb.x0) * P + pad, (bb.y1 - bb.y0) * PH + pad, (bb.z1 - bb.z0) * P + pad);
+}
+
+/* =========================================================
+   UNDO / REDO
+   ========================================================= */
+function pushUndo(rec) {
+  if (!rec.removed.length && !rec.added.length) return;
+  undoStack.push(rec); if (undoStack.length > 60) undoStack.shift(); redoStack.length = 0;
+}
+function applyRec(rec, inverse) {
+  for (const s of (inverse ? rec.added : rec.removed)) world.remove(s.id);
+  for (const s of (inverse ? rec.removed : rec.added)) world.add(s);
+  for (const [a, b] of ((inverse ? rec.gb : rec.ga) || [])) world.addGlue(a, b);
+}
+function undo() { if (anyHeld()) return; const r = undoStack.pop(); if (!r) return; applyRec(r, true); redoStack.push(r); sPop(); }
+function redo() { if (anyHeld()) return; const r = redoStack.pop(); if (!r) return; applyRec(r, false); undoStack.push(r); sPop(); }
+function clearWorld() {
+  if (anyHeld()) return;
+  if (NET.role === 'guest') { flash('Only the host can clear the world'); return; }
+  const removed = [...world.bricks.values()].map(strip), gb = [...world.glue.values()].map(g => [g.a, g.b]);
+  world.clearAll(); netOp({ t: 'clear' }); pushUndo({ removed, added: [], gb, ga: [] }); sTrash(); setSel(null);
+}
+
+
+/* =========================================================
+   SELECTION BOX, BLUEPRINTS, 2x / ½x
+   ========================================================= */
+let selMode = false, sel = null;
+const selLines = new THREE.LineSegments(outlineGeo, new THREE.LineBasicMaterial({ color: 0xffa21f }));
+const selFill = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial({ color: 0xffa21f, transparent: true, opacity: 0.1, depthWrite: false }));
+selLines.visible = selFill.visible = false; scene.add(selLines); scene.add(selFill);
+function flash(msg) { menu.msg = msg; menu.msgT = 2.5; if (menu.open) drawMenu(); }
+function gridBox(a, b) {
+  const q = { x0: Math.floor(Math.min(a.x, b.x) / P), x1: Math.ceil(Math.max(a.x, b.x) / P), y0: Math.max(0, Math.floor(Math.min(a.y, b.y) / PH)),
+    y1: Math.ceil(Math.max(a.y, b.y) / PH), z0: Math.floor(Math.min(a.z, b.z) / P), z1: Math.ceil(Math.max(a.z, b.z) / P) };
+  if (q.x1 <= q.x0) q.x1 = q.x0 + 1; if (q.y1 <= q.y0) q.y1 = q.y0 + 1; if (q.z1 <= q.z0) q.z1 = q.z0 + 1;
+  return q;
+}
+function brickBox(s) { const bb = TYPES[s.t].bb[s.r]; return { x0: s.x + bb.x0, x1: s.x + bb.x1, y0: s.y + bb.y0, y1: s.y + bb.y1, z0: s.z + bb.z0, z1: s.z + bb.z1 }; }
+function statesBox(list) {
+  const b = { x0: Infinity, y0: Infinity, z0: Infinity, x1: -Infinity, y1: -Infinity, z1: -Infinity };
+  for (const s of list) { const q = brickBox(s); b.x0 = Math.min(b.x0, q.x0); b.y0 = Math.min(b.y0, q.y0); b.z0 = Math.min(b.z0, q.z0); b.x1 = Math.max(b.x1, q.x1); b.y1 = Math.max(b.y1, q.y1); b.z1 = Math.max(b.z1, q.z1); }
+  return b;
+}
+function showBox(box, color) {
+  if (!box) { selLines.visible = selFill.visible = false; return; }
+  for (const o of [selLines, selFill]) {
+    o.visible = true;
+    o.position.set((box.x0 + box.x1) / 2 * P, (box.y0 + box.y1) / 2 * PH, (box.z0 + box.z1) / 2 * P);
+    o.scale.set((box.x1 - box.x0) * P + 0.004, (box.y1 - box.y0) * PH + 0.004, (box.z1 - box.z0) * P + 0.004);
+    o.material.color.setHex(color);
+  }
+}
+function setSel(ids) { sel = ids && ids.size ? { ids } : null; if (menu.open) drawMenu(); }
+function selStates() { const out = []; if (sel) for (const id of sel.ids) { const b = world.bricks.get(id); if (b) out.push(b); } return out; }
+function startSelDrag(h, gp) { h.selDrag = { a: gp.clone() }; setSel(null); sTick(0.1); }
+function endSelDrag(h) {
+  const d = h.selDrag; h.selDrag = null;
+  h.grabObj.getWorldPosition(_v1);
+  const box = gridBox(d.a, _v1), ids = new Set();
+  for (const b of world.bricks.values()) {
+    const q = brickBox(b);
+    if (q.x0 >= box.x0 && q.x1 <= box.x1 && q.y0 >= box.y0 && q.y1 <= box.y1 && q.z0 >= box.z0 && q.z1 <= box.z1) ids.add(b.id);
+  }
+  setSel(ids);
+  if (ids.size) { sPop(); buzz(h, 0.4, 20); } else flash('Nothing fully inside the box');
+}
+function updateSelection() {
+  const dh = hands.find(h => h.selDrag);
+  if (dh) { dh.grabObj.getWorldPosition(_v1); showBox(gridBox(dh.selDrag.a, _v1), 0x2fb7ff); return; }
+  if (!sel) { showBox(null); return; }
+  const st = selStates();
+  if (!st.length) { setSel(null); showBox(null); return; }
+  if (st.length !== sel.ids.size) { sel.ids = new Set(st.map(b => b.id)); if (menu.open) drawMenu(); }
+  showBox(statesBox(st), 0xffa21f);
+}
+function grabIds(h, ids, how) {
+  const glueBefore = world.linksOf(ids), idSet = new Set(ids);
+  const states = ids.map(i => world.remove(i)).filter(Boolean);
+  if (!states.length) return;
+  const H = makeHeld(states, states[0], true);
+  H.glueBefore = glueBefore; H.glueInt = glueBefore.filter(([a, b]) => idSet.has(a) && idSet.has(b));
+  attachHeld(h, H, how); sPop(); buzz(h, 0.5, 25);
+}
+function grabSelection(h, gp) {
+  const st = selStates(); if (!st.length) return false;
+  const box = statesBox(st), gx = gp.x / P, gy = gp.y / PH, gz = gp.z / P;
+  if (gx < box.x0 - 0.5 || gx > box.x1 + 0.5 || gy < box.y0 - 1.5 || gy > box.y1 + 1.5 || gz < box.z0 - 0.5 || gz > box.z1 + 0.5) return false;
+  grabIds(h, st.map(b => b.id), 'grip'); setSel(null);
+  return true;
+}
+function statesFit(list, ignore) {
+  const seen = new Set();
+  for (const s of list) for (const c of TYPES[s.t].rc[s.r]) {
+    const y = c.y + s.y; if (y < 0) return false;
+    const k = _key(c.x + s.x, y, c.z + s.z);
+    if (seen.has(k)) return false; seen.add(k);
+    const e = world.occ.get(k); if (e && !(ignore && ignore.has(e.id))) return false;
+  }
+  return true;
+}
+function selAction(id) {
+  if (id === 'select') { if (mode !== 'big') return; selMode = !selMode; if (!selMode) setSel(null); return; }
+  if (!sel || mode !== 'big' || anyHeld()) return;
+  if (id === 'copy') copySel(); else if (id === 'del') deleteSel(); else if (id === 'save') saveSel();
+  else if (id === 'x2') scaleSel(true); else if (id === 'half') scaleSel(false);
+}
+function copySel() {
+  const st = selStates().map(strip), box = statesBox(st), w = box.x1 - box.x0 + 2;
+  let off = null;
+  for (let i = 1; i <= 12 && off === null; i++) if (statesFit(st.map(s => ({ ...s, x: s.x + w * i })))) off = w * i;
+  if (off === null) { flash('No room for a copy'); return; }
+  const map = new Map(), added = [];
+  for (const s of st) { const nb = world.add({ ...s, id: 0, x: s.x + off }); map.set(s.id, nb.id); added.push(strip(nb)); }
+  for (const [a, b] of world.linksOf(st.map(s => s.id))) if (map.has(a) && map.has(b)) world.addGlue(map.get(a), map.get(b));
+  pushUndo({ removed: [], added, gb: [], ga: world.linksOf(added.map(s => s.id)) });
+  setSel(new Set(added.map(s => s.id))); sClick(); flash('Copied - grip the box to move it');
+}
+function deleteSel() {
+  const st = selStates(), box = statesBox(st), ids = st.map(b => b.id), gb = world.linksOf(ids);
+  const removed = ids.map(i => world.remove(i)).filter(Boolean);
+  pushUndo({ removed, added: [], gb, ga: [] });
+  poof(new THREE.Vector3((box.x0 + box.x1) / 2 * P, (box.y0 + box.y1) / 2 * PH, (box.z0 + box.z1) / 2 * P), 0xffa21f);
+  sTrash(); setSel(null);
+}
+function saveSel() {
+  if (blueprints.length >= 18) { flash('Builds is full - delete one first'); return; }
+  const st = selStates(), box = statesBox(st), ix = new Map();
+  const b = st.map((s, i) => { ix.set(s.id, i); const e = [TYPES[s.t].id, s.c, s.x - box.x0, s.y - box.y0, s.z - box.z0, s.r]; if (s.f) e.push(s.f.slice()); return e; });
+  const g = world.linksOf(st.map(s => s.id)).filter(([a, c]) => ix.has(a) && ix.has(c)).map(([a, c]) => [ix.get(a), ix.get(c)]);
+  let n = blueprints.length + 1; while (blueprints.some(x => x.name === 'Build ' + n)) n++;
+  blueprints.push({ name: 'Build ' + n, b, g }); saveBPs();
+  sPop(); flash('Saved to the Builds tab as "Build ' + n + '"');
+  if (pageOf(menu.tab) === 'builds') rebuildMinis();
+}
+function scaleSel(up) {
+  const st = selStates().map(strip); if (!st.length) return;
+  const box = statesBox(st), out = [];
+  for (const s of st) {
+    const t = TYPES[s.t], base = t.base ? T[t.base] : t, k = t.k || 1, nk = up ? k * 2 : k / 2;
+    if (up && nk > 4) { flash('That is as big as it goes (4x)'); return; }
+    const dx = s.x - box.x0, dy = s.y - box.y0, dz = s.z - box.z0;
+    if (!up && (nk < 1 || dx % 2 || dy % 2 || dz % 2)) { flash('Only blocks you enlarged can shrink back'); return; }
+    const f = up ? 2 : 0.5, nt = nk === 1 ? base : scaledType(base, nk);
+    out.push({ ...s, t: nt.idx, x: box.x0 + dx * f, y: box.y0 + dy * f, z: box.z0 + dz * f });
+  }
+  const ids = new Set(st.map(s => s.id));
+  let lift = 0;
+  while (lift < 400 && !statesFit(out.map(s => ({ ...s, y: s.y + lift })), ids)) lift++;
+  if (lift >= 400) { flash('No room to resize here'); return; }
+  const gb = world.linksOf([...ids]);
+  for (const s of st) world.remove(s.id);
+  const added = out.map(s => strip(world.add({ ...s, y: s.y + lift })));
+  for (const [a, b] of gb) if (ids.has(a) && ids.has(b)) world.addGlue(a, b);
+  pushUndo({ removed: st, added, gb, ga: world.linksOf([...ids]) });
+  setSel(new Set(added.map(s => s.id))); if (up) sGrow(); else sShrink();
+}
+function bpStates(bp) {
+  const out = [];
+  for (const e of bp.b) {
+    const t = typeById(e[0]); if (!t) continue;
+    const s = { id: 0, t: t.idx, c: e[1], x: e[2], y: e[3], z: e[4], r: e[5] };
+    if (e[6]) s.f = e[6].slice();
+    out.push(s);
+  }
+  return out;
+}
+function spawnBlueprint(h, bp, gp, how) {
+  const st = bpStates(bp); if (!st.length) return;
+  const H = makeHeld(st, { x: 0, y: 0, z: 0 }, false);
+  if (st.length === bp.b.length) H.glueInt = (bp.g || []).map(([i, j]) => [H.bricks[i].id, H.bricks[j].id]);
+  const box = statesBox(st);
+  H.group.quaternion.setFromAxisAngle(UP, headYawWorld());
+  const c = new THREE.Vector3((box.x0 + box.x1) / 2 * P, (box.y0 + box.y1) / 2 * PH, (box.z0 + box.z1) / 2 * P).applyQuaternion(H.group.quaternion);
+  H.group.position.copy(gp).sub(c);
+  attachHeld(h, H, how); sPop(); buzz(h, 0.5, 25);
+}
+
+/* =========================================================
+   MINIFIG POSING, SITTING, YOUR BODY, FRIENDS' AVATARS
+   ========================================================= */
+const LIMB_END = { head: [P, 0.128, 0.5 * P], armL: [P - 0.04, 0.058, 0.5 * P], armR: [P + 0.04, 0.058, 0.5 * P],
+  legL: [P - 0.019, 0.006, 0.5 * P + 0.004], legR: [P + 0.019, 0.006, 0.5 * P + 0.004] };
+function brickMatrix(b, out) { out.makeRotationY(b.r * HALF); out.setPosition(b.x * P, b.y * PH, b.z * P); return out; }
+function figLimbAt(gp) {
+  const id = world.nearest(gp, 0.12, b => TYPES[b.t].fig); if (!id) return null;
+  const b = world.bricks.get(id), t = TYPES[b.t], k = t.k || 1, yo = t.fig === 'sit' ? -0.035 : 0;
+  brickMatrix(b, _m4);
+  let best = null, bd = (0.024 * k) ** 2;
+  for (const [pose, e] of Object.entries(LIMB_END)) {
+    const part = t.parts.find(p => p.pose === pose); if (!part) continue;
+    const v = new THREE.Vector3(e[0] * k, (e[1] + yo) * k, e[2] * k).applyMatrix4(partLocal(part, b, _m3)).applyMatrix4(_m4);
+    const d = v.distanceToSquared(gp);
+    if (d < bd) { bd = d; best = { id, pose, part }; }
+  }
+  return best;
+}
+function updatePose(h) {
+  const ps = h.posing, b = world.bricks.get(ps.id);
+  if (!b) { h.posing = null; return; }
+  h.grabObj.getWorldPosition(_v1);
+  brickMatrix(b, _m4).invert(); _v1.applyMatrix4(_m4);
+  const pv = ps.part.pivot, vx = _v1.x - pv[0], vy = _v1.y - pv[1], vz = _v1.z - pv[2];
+  if (!b.f) b.f = DEF_FIG.slice();
+  const ix = POSE_IX[ps.pose];
+  let a;
+  if (ps.pose === 'head') a = Math.max(-1.4, Math.min(1.4, Math.atan2(vx, vz)));
+  else if (ps.pose === 'legL' || ps.pose === 'legR') a = Math.max(-1.7, Math.min(1.0, Math.atan2(-vz, -vy)));
+  else a = Math.atan2(-vz, -vy);
+  if (Math.abs(a - b.f[ix]) > 0.002) {
+    b.f[ix] = a; world.batch.update(b); dirty();
+    const now = performance.now();
+    if (!ps.sent || now - ps.sent > 80) { ps.sent = now; netOp({ t: 'pose', id: b.id, f: b.f.slice() }); }
+  }
+}
+function endPose(h) {
+  const ps = h.posing; h.posing = null;
+  const b = world.bricks.get(ps.id); if (!b) return;
+  if (!b.f) b.f = DEF_FIG.slice();
+  const t = TYPES[b.t], k = t.k || 1, sit = t.fig === 'sit', wantSit = b.f[9] < -1.15 && b.f[10] < -1.15;
+  if (wantSit !== sit) { // legs forward = sit down, legs down = stand up
+    const base = wantSit ? T.figsit : T.fig, nt = k > 1 ? scaledType(base, k) : base;
+    const s = { ...strip(b), t: nt.idx };
+    if (wantSit) s.f[9] = s.f[10] = -HALF;
+    if (statesFit([s], new Set([b.id]))) {
+      const gb = world.linksOf([b.id]);
+      world.remove(b.id); world.add(s);
+      for (const [x, y] of gb) world.addGlue(x, y);
+      sClick();
+      return;
+    }
+  }
+  netOp({ t: 'pose', id: b.id, f: b.f.slice() });
+}
+function buildFigGroup(f, opts = {}) {
+  const g = new THREE.Group();
+  for (const p of T.fig.parts) {
+    if (opts.skip && opts.skip(p)) continue;
+    const mat = new THREE.MeshStandardMaterial({ roughness: 0.32, metalness: 0 });
+    partColor({ f, c: 0 }, p, mat.color);
+    const mesh = new THREE.Mesh(p.g, mat); mesh.matrixAutoUpdate = false; mesh.userData.part = p; mesh.castShadow = true;
+    g.add(mesh);
+  }
+  poseFigGroup(g, f);
+  return g;
+}
+function poseFigGroup(g, f) {
+  const br = { f };
+  for (const m of g.children) {
+    const p = m.userData.part; if (!p) continue;
+    if (p.vis) { m.visible = p.vis(f); if (!m.visible) continue; }
+    partLocal(p, br, m.matrix); m.matrixWorldNeedsUpdate = true;
+  }
+}
+function recolorFig(g, f) { for (const m of g.children) { const p = m.userData.part; if (p) partColor({ f, c: 0 }, p, m.material.color); } }
+function disposeFig(g) { g.traverse(o => { if (o.isMesh && o.material && o.material !== HAND_MAT) o.material.dispose(); }); }
+
+// your own minifig body, visible when you look down in shrink mode
+let myBody = null, bodyPhase = 0;
+const lastHead = new THREE.Vector3();
+function updateMyBody(dt) {
+  if (!myBody) {
+    myBody = buildFigGroup([...FIG, 0, 0, 0, 0, 0], { skip: p => p.pose === 'head' || p.pose === 'armL' || p.pose === 'armR' });
+    myBody.userData.f = [...FIG, 0, 0, 0, 0, 0]; myBody.visible = false; scene.add(myBody);
+  }
+  const show = mode === 'small' && !trans;
+  myBody.visible = show; if (!show) return;
+  const hp = headWorld(_v1), yaw = headYawWorld(), s = rig.scale.x / SMALL;
+  const sp = Math.hypot(hp.x - lastHead.x, hp.z - lastHead.z) / Math.max(dt, 1e-3) / rig.scale.x; lastHead.copy(hp);
+  const amt = Math.min(1, sp / 1.2); bodyPhase += dt * 9 * amt;
+  const f = myBody.userData.f; f[9] = 0.6 * amt * Math.sin(bodyPhase); f[10] = -f[9];
+  poseFigGroup(myBody, f);
+  const th = yaw + Math.PI;
+  myBody.scale.setScalar(s); myBody.rotation.set(0, th, 0);
+  _v2.set(-P * s, 0, -(0.5 * P + 0.01) * s).applyAxisAngle(UP, th);
+  myBody.position.set(hp.x + _v2.x, rig.position.y, hp.z + _v2.z);
+}
+
+/* =========================================================
+   ONLINE: host / join with a 5-digit code (PeerJS), up to 4 players, voice
+   ========================================================= */
+const NET = { role: null, code: '', peer: null, conns: [], hostConn: null, slot: 0, players: new Map(), applying: false, out: [],
+  status: 'Offline', stream: null, silent: null, muted: false, calls: [], roster: null };
+const PEER_PREFIX = 'brickstudio-v1-';
+const handGeo = new RoundedBoxGeometry(0.028, 0.075, 0.09, 2, 0.012);
+const r3 = v => Math.round(v * 1000) / 1000;
+let netKey = 0, stTimer = 0;
+function encS(s) { return { ...s, t: TYPES[s.t].id }; }
+function decS(s) { return { ...s, t: (typeById(s.t) || T.b1x1).idx }; }
+function netOp(op) { if (!NET.role || NET.applying) return; NET.out.push(op.s ? { ...op, s: encS(op.s) } : op); }
+function sendAll(d) {
+  try {
+    if (NET.role === 'host') { for (const c of NET.conns) if (c.open) c.send(d); }
+    else if (NET.hostConn && NET.hostConn.open) NET.hostConn.send(d);
+  } catch (e) { }
+}
+function relay(from, d) { for (const c of NET.conns) if (c !== from && c.open) try { c.send(d); } catch (e) { } }
+function setNetStatus(s) { NET.status = s; if (menu.open) drawMenu(); }
+function snapshot() {
+  const b = [], g = [];
+  for (const x of world.bricks.values()) b.push([x.id, TYPES[x.t].id, x.c, x.x, x.y, x.z, x.r, x.f || 0]);
+  for (const l of world.glue.values()) g.push([l.a, l.b]);
+  return { b, g };
+}
+function applySnapshot(w) {
+  NET.applying = true;
+  try {
+    world.clearAll();
+    for (const [id, tid, c, x, y, z, r, f] of w.b) { const t = typeById(tid); if (t) world.add({ id, t: t.idx, c, x, y, z, r, f: f || undefined }); }
+    for (const [a, b] of w.g) world.addGlue(a, b);
+  } finally { NET.applying = false; }
+  undoStack.length = 0; redoStack.length = 0; setSel(null);
+}
+function applyOps(ops) {
+  NET.applying = true;
+  try {
+    for (const op of ops) {
+      if (op.t === 'add') world.add(decS(op.s));
+      else if (op.t === 'rem') world.remove(op.id);
+      else if (op.t === 'glue') world.addGlue(op.a, op.b);
+      else if (op.t === 'door') { const b = world.bricks.get(op.id); if (b) { b.open = op.open; animDoors.add(b.id); worldVer++; } }
+      else if (op.t === 'pose') { const b = world.bricks.get(op.id); if (b) { b.f = op.f; world.batch.update(b); } }
+      else if (op.t === 'clear') world.clearAll();
+    }
+  } finally { NET.applying = false; }
+}
+function loadPeer() {
+  if (window.Peer) return Promise.resolve();
+  return new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';
+    s.onload = res; s.onerror = rej; document.head.appendChild(s);
+  });
+}
+async function hostGame() {
+  if (NET.role || NET.peer) return;
+  setNetStatus('Starting...');
+  try { await loadPeer(); } catch (e) { setNetStatus('Could not reach the online service'); return; }
+  const code = String(Math.floor(10000 + Math.random() * 90000));
+  const peer = new Peer(PEER_PREFIX + code); NET.peer = peer;
+  peer.on('open', () => {
+    NET.role = 'host'; NET.code = code; NET.slot = 0; world.idBase = 0;
+    NET.roster = [{ slot: 0, pid: peer.id }];
+    setNetStatus('Hosting'); flash('Your code is ' + code); startVoice();
+  });
+  peer.on('connection', conn => {
+    conn.on('open', () => {
+      if (NET.conns.length >= 3) { try { conn.send({ t: 'full' }); } catch (e) { } setTimeout(() => conn.close(), 500); return; }
+      const used = new Set(NET.conns.map(c => c.slot)); let s = 1; while (used.has(s)) s++;
+      conn.slot = s; NET.conns.push(conn);
+      conn.send({ t: 'welcome', slot: s, w: snapshot() });
+      sendRoster(); flash('Player ' + (s + 1) + ' joined'); sPop();
+    });
+    conn.on('data', d => onData(conn, d));
+    conn.on('close', () => dropConn(conn));
+    conn.on('error', () => dropConn(conn));
+  });
+  peer.on('call', answerCall);
+  peer.on('error', e => {
+    if (NET.role) { setNetStatus('Online problem: ' + e.type); return; }
+    setNetStatus(e.type === 'unavailable-id' ? 'That code was taken - press Host again' : 'Could not start: ' + e.type);
+    try { peer.destroy(); } catch (x) { } NET.peer = null;
+  });
+}
+async function joinGame(code) {
+  if (NET.role || NET.peer) return;
+  setNetStatus('Connecting to ' + code + '...');
+  try { await loadPeer(); } catch (e) { setNetStatus('Could not reach the online service'); return; }
+  const peer = new Peer(); NET.peer = peer;
+  peer.on('open', () => {
+    const conn = peer.connect(PEER_PREFIX + code, { reliable: true });
+    const to = setTimeout(() => { if (NET.role !== 'guest') { setNetStatus('No world found with code ' + code); try { peer.destroy(); } catch (x) { } NET.peer = null; } }, 15000);
+    conn.on('open', () => { clearTimeout(to); dropEverything(); saveNow(); NET.role = 'guest'; NET.hostConn = conn; NET.code = code; setNetStatus('Joining...'); });
+    conn.on('data', d => onData(conn, d));
+    conn.on('close', () => { if (NET.role === 'guest') leaveGame('The host closed the world'); });
+  });
+  peer.on('call', answerCall);
+  peer.on('error', e => {
+    if (NET.role === 'guest') { setNetStatus('Online problem: ' + e.type); return; }
+    setNetStatus(e.type === 'peer-unavailable' ? 'No world found with code ' + code : 'Could not connect: ' + e.type);
+    try { peer.destroy(); } catch (x) { } NET.peer = null;
+  });
+}
+function leaveGame(msg) {
+  if (!NET.role && !NET.peer) return;
+  const wasGuest = NET.role === 'guest';
+  for (const c of NET.calls) { try { c.close(); } catch (e) { } if (c._audio) c._audio.srcObject = null; }
+  if (NET.stream) NET.stream.getTracks().forEach(t => t.stop());
+  try { NET.peer && NET.peer.destroy(); } catch (e) { }
+  for (const s of [...NET.players.keys()]) removePlayer(s);
+  Object.assign(NET, { role: null, code: '', peer: null, conns: [], hostConn: null, slot: 0, calls: [], stream: null, out: [], roster: null });
+  world.idBase = 0;
+  if (wasGuest) { dropEverything(); setSel(null); loadSlot(slot); }
+  setNetStatus(msg || 'Offline'); if (msg) flash(msg);
+}
+function dropConn(conn) {
+  if (!NET.conns.includes(conn)) return;
+  NET.conns = NET.conns.filter(c => c !== conn);
+  removePlayer(conn.slot); sendAll({ t: 'left', slot: conn.slot }); sendRoster();
+  flash('Player ' + (conn.slot + 1) + ' left');
+}
+function sendRoster() {
+  if (NET.role !== 'host') return;
+  NET.roster = [{ slot: 0, pid: NET.peer.id }, ...NET.conns.map(c => ({ slot: c.slot, pid: c.peer }))];
+  sendAll({ t: 'roster', list: NET.roster });
+  if (menu.open) drawMenu();
+}
+function onData(conn, d) {
+  if (!d || !d.t) return;
+  if (NET.role === 'host') {
+    if (d.t === 'ops') { applyOps(d.ops); relay(conn, d); }
+    else if (d.t === 'st') { d.slot = conn.slot; gotState(d); relay(conn, d); }
+    else if (d.t === 'hold' || d.t === 'drop') { d.slot = conn.slot; gotHold(d); relay(conn, d); }
+    return;
+  }
+  switch (d.t) {
+    case 'welcome':
+      NET.slot = d.slot; world.idBase = d.slot * 1e9; world.nextId = 1;
+      applySnapshot(d.w); setNetStatus('Joined'); flash('Joined world ' + NET.code); startVoice(); break;
+    case 'ops': applyOps(d.ops); break;
+    case 'st': gotState(d); break;
+    case 'hold': case 'drop': gotHold(d); break;
+    case 'snap': applySnapshot(d.w); break;
+    case 'left': removePlayer(d.slot); if (menu.open) drawMenu(); break;
+    case 'roster':
+      NET.roster = d.list;
+      for (const s of [...NET.players.keys()]) if (!d.list.some(r => r.slot === s)) removePlayer(s);
+      callPeers(); if (menu.open) drawMenu(); break;
+    case 'full': leaveGame('That world is full (4 players)'); break;
+  }
+}
+// voice chat: everyone calls the players with a lower number
+async function startVoice() {
+  try { NET.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
+  catch (e) { NET.stream = null; flash('No mic access - you can still hear others'); }
+  setMute(); callPeers();
+}
+function setMute() { if (NET.stream) NET.stream.getAudioTracks().forEach(t => { t.enabled = !NET.muted; }); }
+function outStream() {
+  if (NET.stream) return NET.stream;
+  const a = ac(); if (!a) return null;
+  if (!NET.silent) NET.silent = a.createMediaStreamDestination().stream;
+  return NET.silent;
+}
+function hookCall(call) {
+  NET.calls.push(call);
+  call.on('stream', rs => { if (call._audio) return; const el = new Audio(); el.srcObject = rs; el.autoplay = true; el.play().catch(() => { }); call._audio = el; });
+  call.on('close', () => { if (call._audio) call._audio.srcObject = null; NET.calls = NET.calls.filter(c => c !== call); });
+}
+function answerCall(call) { try { call.answer(outStream() || undefined); } catch (e) { } hookCall(call); }
+function callPeers() {
+  if (!NET.peer || !NET.roster || !NET.role) return;
+  for (const r of NET.roster) {
+    if (r.slot >= NET.slot || NET.calls.some(c => c.peer === r.pid)) continue;
+    const s = outStream(); if (!s) continue;
+    try { hookCall(NET.peer.call(r.pid, s)); } catch (e) { }
+  }
+}
+function netButton(id) {
+  if (id === 'host') { if (!NET.role) { menu.entry = null; hostGame(); } }
+  else if (id === 'join') { if (!NET.role) menu.entry = menu.entry === null ? '' : null; }
+  else if (id === 'leave') leaveGame();
+  else if (id === 'mic') { if (NET.role) { NET.muted = !NET.muted; setMute(); } }
+}
+function keyPress(k) {
+  if (menu.entry === null) return;
+  if (k === '⌫') menu.entry = menu.entry.slice(0, -1);
+  else if (k === 'Go') { if (menu.entry.length === 5) { const c = menu.entry; menu.entry = null; joinGame(c); } else flash('Codes have 5 digits'); }
+  else if (menu.entry.length < 5) menu.entry += k;
+}
+// avatars: friends appear as their minifig, sized to how big they are right now
+function makeAvatar(slot) {
+  const g = buildFigGroup(DEF_FIG.slice()); scene.add(g);
+  const hm = [0, 1].map(() => { const m = new THREE.Mesh(handGeo, HAND_MAT); m.castShadow = true; m.visible = false; scene.add(m); return m; });
+  const tag = textPanel(0.16, 0.05, (c, W, H) => {
+    rr(c, 2, 2, W - 4, H - 4, 30); c.fillStyle = PCOLORS[slot] || '#555'; c.fill();
+    c.fillStyle = '#fff'; c.font = '800 44px system-ui'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText('Player ' + (slot + 1), W / 2, H / 2 + 2);
+  });
+  scene.add(tag);
+  return { g, hm, tag, st: null, cur: null, f: DEF_FIG.slice(), look: '', held: new Map(), seen: performance.now() };
+}
+function playerOf(slot) { let p = NET.players.get(slot); if (!p) { p = makeAvatar(slot); NET.players.set(slot, p); if (menu.open) drawMenu(); } return p; }
+function removePlayer(slot) {
+  const p = NET.players.get(slot); if (!p) return;
+  scene.remove(p.g); disposeFig(p.g); for (const m of p.hm) scene.remove(m);
+  scene.remove(p.tag); p.tag.material.map.dispose(); p.tag.material.dispose();
+  for (const e of p.held.values()) { e.batch.dispose(); scene.remove(e.group); }
+  NET.players.delete(slot);
+}
+function gotState(d) {
+  if (d.slot === NET.slot) return;
+  const p = playerOf(d.slot);
+  p.st = d; p.seen = performance.now();
+  const look = (d.fig || []).join(',');
+  if (look && look !== p.look) { p.look = look; for (let i = 0; i < 6; i++) p.f[i] = d.fig[i]; recolorFig(p.g, p.f); }
+  for (const [key, ...m] of d.hp || []) { const e = p.held.get(key); if (e) e.tgt = m; }
+}
+function gotHold(d) {
+  if (d.slot === NET.slot) return;
+  const p = playerOf(d.slot);
+  if (d.t === 'hold') {
+    const group = new THREE.Group(); group.visible = false; scene.add(group);
+    const batch = new BatchSet(group, 'normal');
+    let id = -1; for (const s of d.b) { const q = decS(s); q.id = id--; batch.add(q); }
+    p.held.set(d.key, { group, batch, tgt: null });
+  } else {
+    const e = p.held.get(d.key); if (!e) return;
+    e.batch.dispose(); scene.remove(e.group); p.held.delete(d.key);
+  }
+}
+function updateAvatars(dt) {
+  const k = Math.min(1, dt * 12);
+  for (const [slot, p] of NET.players) {
+    if (performance.now() - p.seen > 10000) { removePlayer(slot); continue; }
+    const d = p.st; if (!d) continue;
+    const figS = d.s / SMALL;
+    if (!p.cur) p.cur = { x: d.hd[0], y: d.fy, z: d.hd[2], yaw: d.hd[3] };
+    p.cur.x += (d.hd[0] - p.cur.x) * k; p.cur.y += (d.fy - p.cur.y) * k; p.cur.z += (d.hd[2] - p.cur.z) * k;
+    const dy = Math.atan2(Math.sin(d.hd[3] - p.cur.yaw), Math.cos(d.hd[3] - p.cur.yaw)); p.cur.yaw += dy * k;
+    const th = p.cur.yaw + Math.PI;
+    p.g.scale.setScalar(figS); p.g.rotation.set(0, th, 0);
+    _v2.set(-P * figS, 0, -(0.5 * P + 0.01) * figS).applyAxisAngle(UP, th);
+    p.g.position.set(p.cur.x + _v2.x, p.cur.y, p.cur.z + _v2.z);
+    p.g.updateMatrixWorld(true); _m4.copy(p.g.matrixWorld).invert();
+    (d.hn || []).forEach((hd, i) => {
+      const m = p.hm[i]; if (!hd) { m.visible = false; return; }
+      m.visible = true;
+      if (!m.userData.init) { m.position.set(hd[0], hd[1], hd[2]); m.userData.init = true; }
+      m.position.lerp(_v1.set(hd[0], hd[1], hd[2]), k); m.quaternion.slerp(_q.set(hd[3], hd[4], hd[5], hd[6]), k); m.scale.setScalar(d.s);
+      _v1.set(hd[0], hd[1], hd[2]).applyMatrix4(_m4); // left hand moves the arm on the +x side
+      p.f[i === 0 ? 8 : 7] = Math.atan2(-(_v1.z - 0.5 * P), -(_v1.y - 0.098));
+    });
+    poseFigGroup(p.g, p.f);
+    p.tag.position.set(p.cur.x, p.cur.y + 0.165 * figS, p.cur.z); p.tag.scale.setScalar(Math.max(0.3, figS * 0.25));
+    p.tag.lookAt(headWorld(_v4));
+    for (const e of p.held.values()) if (e.tgt) { e.group.visible = true; _m3.fromArray(e.tgt); _m3.decompose(e.group.position, e.group.quaternion, e.group.scale); }
+  }
+}
+function updateNet(dt) {
+  if (!NET.role) return;
+  if (NET.out.length) { sendAll({ t: 'ops', ops: NET.out }); NET.out = []; }
+  stTimer -= dt; if (stTimer > 0) return; stTimer = 0.06;
+  const hp = headWorld(new THREE.Vector3());
+  const hn = ['left', 'right'].map(side => {
+    const h = hands.find(x => x.side === side && x.src && x.model); if (!h) return null;
+    h.grip.getWorldPosition(_v1); h.grip.getWorldQuaternion(_q);
+    return [r3(_v1.x), r3(_v1.y), r3(_v1.z), r3(_q.x), r3(_q.y), r3(_q.z), r3(_q.w)];
+  });
+  const hpz = [];
+  for (const h of hands) if (h.held && h.held.netKey) { h.held.group.updateWorldMatrix(true, false); hpz.push([h.held.netKey, ...h.held.group.matrixWorld.elements.map(r3)]); }
+  sendAll({ t: 'st', slot: NET.slot, hd: [r3(hp.x), r3(hp.y), r3(hp.z), r3(headYawWorld())], hn, s: r3(rig.scale.x), fy: r3(rig.position.y), fig: FIG, hp: hpz });
+}
+
+/* =========================================================
+   DOORS
+   ========================================================= */
+function toggleDoor(id) {
+  const b = world.bricks.get(id); if (!b) return;
+  if (b.open && playerInDoor(b)) return;
+  b.open = !b.open; animDoors.add(id); worldVer++; sDoor(); netOp({ t: 'door', id, open: b.open });
+}
+function playerInDoor(b) {
+  for (const c of world.cells(b)) {
+    if (!c.open) continue;
+    if (pl.x + PR > c.x && pl.x - PR < c.x + 1 && pl.z + PR > c.z && pl.z - PR < c.z + 1 && pl.y + PHT > c.y && pl.y < c.y + 1) return true;
+  }
+  return false;
+}
+function updateDoors(dt) {
+  for (const id of animDoors) {
+    const b = world.bricks.get(id); if (!b) { animDoors.delete(id); continue; }
+    const target = b.open ? 1 : 0;
+    b.ang += (target - b.ang) * Math.min(1, dt * 9);
+    if (Math.abs(target - b.ang) < 0.005) { b.ang = target; animDoors.delete(id); }
+    world.batch.update(b);
+  }
+}
+
+/* =========================================================
+   MOVEMENT
+   ========================================================= */
+const pl = { x: 0, y: 0, z: 0, vy: 0, ground: false };
+const PR = 0.35, PHT = 9, STEP = 3.05;
+const GRAV = 9.8 * SMALL / PH, JUMP = Math.sqrt(2 * GRAV * 4.2), WALK = 2.2 * SMALL / P;
+function solidBox(x0, x1, y0, y1, z0, z1) {
+  for (let x = Math.floor(x0); x < Math.ceil(x1); x++) for (let z = Math.floor(z0); z < Math.ceil(z1); z++) for (let y = Math.floor(y0); y < Math.ceil(y1); y++) if (world.isSolid(x, y, z)) return true;
+  return false;
+}
+function topIn(x0, x1, y0, y1, z0, z1) {
+  let t = -Infinity;
+  for (let x = Math.floor(x0); x < Math.ceil(x1); x++) for (let z = Math.floor(z0); z < Math.ceil(z1); z++) for (let y = Math.floor(y0); y < Math.ceil(y1); y++) if (world.isSolid(x, y, z)) t = Math.max(t, y + 1);
+  return t;
+}
+const bodyHit = (x, y, z) => solidBox(x - PR, x + PR, y + 0.02, y + PHT, z - PR, z + PR);
+function tryMove(ax, d) {
+  const nx = ax === 'x' ? pl.x + d : pl.x, nz = ax === 'z' ? pl.z + d : pl.z;
+  if (!bodyHit(nx, pl.y, nz)) { pl.x = nx; pl.z = nz; return; }
+  if (pl.ground) {
+    const t = topIn(nx - PR, nx + PR, pl.y + 0.02, pl.y + STEP, nz - PR, nz + PR);
+    if (t > pl.y && t - pl.y <= STEP && !bodyHit(nx, t, nz)) { pl.x = nx; pl.z = nz; pl.y = t; }
+  }
+}
+function stickOf(h) {
+  const gp = h && h.src && h.src.gamepad; if (!gp || gp.axes.length < 4) return [0, 0];
+  const dz = v => Math.abs(v) < 0.15 ? 0 : (v - Math.sign(v) * 0.15) / 0.85;
+  return [dz(gp.axes[2]), dz(gp.axes[3])];
+}
+function updateBig(dt, L, Rh) {
+  const [lx, ly] = stickOf(L), [rx, ry] = stickOf(Rh), yaw = headYawWorld();
+  const boost = L && L.bNow[0] ? 3 : 1, sp = 1.5 * boost;
+  rig.position.x += (-Math.sin(yaw) * (-ly) + Math.cos(yaw) * lx) * sp * dt;
+  rig.position.z += (-Math.cos(yaw) * (-ly) - Math.sin(yaw) * lx) * sp * dt;
+  if (Math.abs(ry) > Math.abs(rx)) rig.position.y -= ry * 1.3 * boost * dt;
+  // you can sink until your eyes are 25cm above the floor, so it's in easy reach without crouching
+  rig.position.y = Math.max(Math.min(0, 0.25 - camera.position.y), rig.position.y);
+}
+function updateSmall(dt, L, Rh) {
+  const hp = headWorld(_v1), tx = hp.x / P, tz = hp.z / P;
+  const [lx, ly] = stickOf(L), yaw = headYawWorld();
+  const mxv = (-Math.sin(yaw) * (-ly) + Math.cos(yaw) * lx) * WALK * dt;
+  const mzv = (-Math.cos(yaw) * (-ly) - Math.sin(yaw) * lx) * WALK * dt;
+  const gx = tx + mxv, gz = tz + mzv, dx = gx - pl.x, dz = gz - pl.z;
+  const n = Math.max(1, Math.ceil(Math.max(Math.abs(dx), Math.abs(dz)) / 0.25));
+  for (let i = 0; i < n; i++) { tryMove('x', dx / n); tryMove('z', dz / n); }
+  if (Rh && Rh.ev.b4 && pl.ground) { pl.vy = JUMP; pl.ground = false; sJump(); }
+  pl.vy = Math.max(-80, pl.vy - GRAV * dt);
+  const ny = pl.y + pl.vy * dt;
+  if (pl.vy <= 0) {
+    const t = topIn(pl.x - PR, pl.x + PR, ny, pl.y + 0.01, pl.z - PR, pl.z + PR);
+    if (t > -Infinity && t >= ny) { pl.y = Math.max(t, ny); pl.vy = 0; pl.ground = true; }
+    else { pl.y = ny; pl.ground = false; }
+  } else {
+    if (solidBox(pl.x - PR, pl.x + PR, pl.y + PHT, ny + PHT, pl.z - PR, pl.z + PR)) pl.vy = 0; else pl.y = ny;
+    pl.ground = false;
+  }
+  if (bodyHit(pl.x, pl.y, pl.z)) { // pushed into something: climb out
+    const t = topIn(pl.x - PR, pl.x + PR, pl.y, pl.y + PHT, pl.z - PR, pl.z + PR);
+    if (t - pl.y < 4) pl.y = t;
+  }
+  rig.position.x += (pl.x - tx) * P; rig.position.z += (pl.z - tz) * P; rig.position.y = pl.y * PH;
+}
+function snapTurn(a) {
+  const hp = headWorld(new THREE.Vector3());
+  rig.position.sub(hp).applyAxisAngle(UP, a).add(hp); rig.rotation.y += a;
+}
+function groundUnder(hp) {
+  const x = Math.floor(hp.x / P), z = Math.floor(hp.z / P);
+  for (let y = Math.max(1, Math.floor(hp.y / PH)); y >= 1; y--)
+    if (world.isSolid(x, y - 1, z) && !bodyHit(hp.x / P, y, hp.z / P)) return y * PH;
+  return 0;
+}
+function setMode(m) {
+  if (trans || m === mode) return;
+  dropEverything();
+  const hp = headWorld(new THREE.Vector3());
+  trans = { m, from: rig.scale.x, to: m === 'small' ? SMALL : 1, t: 0, hx: hp.x, hz: hp.z, y0: rig.position.y, y1: m === 'small' ? groundUnder(hp) : rig.position.y };
+  if (m === 'small') sShrink(); else sGrow();
+}
+function updateTrans(dt) {
+  const t = trans; t.t = Math.min(1, t.t + dt / 0.9);
+  const e = t.t * t.t * (3 - 2 * t.t), s = t.from + (t.to - t.from) * e;
+  rig.scale.setScalar(s);
+  const cl = camera.position; _v1.set(cl.x * s, 0, cl.z * s).applyAxisAngle(UP, rig.rotation.y);
+  rig.position.x = t.hx - _v1.x; rig.position.z = t.hz - _v1.z; rig.position.y = t.y0 + (t.y1 - t.y0) * e;
+  applyScaleEnv(s);
+  if (t.t >= 1) {
+    mode = t.m; trans = null;
+    if (mode === 'small') { pl.x = t.hx / P; pl.z = t.hz / P; pl.y = t.y1 / PH; pl.vy = 0; pl.ground = true; }
+    menu.miniRoot.visible = mode === 'big';
+    drawMenu();
+  }
+}
+
+/* =========================================================
+   SAVE SLOTS (auto-save)
+   ========================================================= */
+const SKEY = 'brickstudio_slot_';
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) { } },
+};
+let FIG = (() => { try { const a = JSON.parse(store.get('brickstudio_fig') || 'null'); if (Array.isArray(a) && a.length === 6) return a; } catch (e) { } return DEF_FIG.slice(0, 6); })();
+function saveFig() { store.set('brickstudio_fig', JSON.stringify(FIG)); if (myBody) { scene.remove(myBody); disposeFig(myBody); myBody = null; } }
+let blueprints = (() => { try { const a = JSON.parse(store.get('brickstudio_bp') || '[]'); return Array.isArray(a) ? a : []; } catch (e) { return []; } })();
+function saveBPs() { store.set('brickstudio_bp', JSON.stringify(blueprints)); }
+function serialize() {
+  const b = [], ix = new Map();
+  for (const x of world.bricks.values()) { ix.set(x.id, b.length); const e = [TYPES[x.t].id, x.c, x.x, x.y, x.z, x.r]; if (x.f) e.push(x.f); b.push(e); }
+  const g = []; for (const l of world.glue.values()) g.push([ix.get(l.a), ix.get(l.b)]);
+  return JSON.stringify({ v: 2, b, g });
+}
+function saveNow() { if (NET.role === 'guest') return; store.set(SKEY + slot, serialize()); store.set('brickstudio_cur', String(slot)); saveTimer = 0; }
+function loadSlot(n) {
+  NET.applying = true;
+  world.clearAll(); undoStack.length = 0; redoStack.length = 0;
+  try {
+    const s = JSON.parse(store.get(SKEY + n) || 'null');
+    if (s && s.b) {
+      const ids = s.b.map(([tid, c, x, y, z, r, f]) => { const t = typeById(tid); return t ? world.add({ t: t.idx, c, x, y, z, r, f: f || undefined }).id : 0; });
+      if (s.g) for (const [i, j] of s.g) if (ids[i] && ids[j]) world.addGlue(ids[i], ids[j]);
+    }
+  } catch (e) { }
+  NET.applying = false;
+  saveTimer = 0;
+}
+function switchSlot(d) {
+  if (anyHeld()) return;
+  if (NET.role === 'guest') { flash('Only the host can switch worlds'); return; }
+  saveNow(); slot = ((slot - 1 + d) % 5 + 5) % 5 + 1; loadSlot(slot); store.set('brickstudio_cur', String(slot)); setSel(null);
+  if (NET.role === 'host') sendAll({ t: 'snap', w: snapshot() });
+}
+document.addEventListener('visibilitychange', () => { if (document.hidden) saveNow(); });
+renderer.xr.addEventListener('sessionend', saveNow);
+
+/* starter scene: a little house so the room isn't empty the first time */
+function seedStarter() {
+  const S = (id, c, x, y, z, r = 0) => world.add({ t: T[id].idx, c, x, y, z, r });
+  const X0 = -4, Z0 = -26;
+  S('p16x16', 10, X0 - 4, 0, Z0 - 5);
+  [1, 4, 7, 10, 13].forEach((y, ci) => {
+    if (ci % 2 === 0) { S('b1x4', 0, X0, y, Z0); S('b1x4', 0, X0 + 4, y, Z0); }
+    else { S('b1x2', 0, X0, y, Z0); S('b1x4', 0, X0 + 2, y, Z0); S('b1x2', 0, X0 + 6, y, Z0); }
+    S('b1x2', 0, X0, y, Z0 + 5); S('b1x2', 0, X0 + 6, y, Z0 + 5);
+    if (ci === 0 || ci === 4) { S('b1x4', 0, X0, y, Z0 + 5, 1); S('b1x4', 0, X0 + 7, y, Z0 + 5, 1); }
+  });
+  S('winL', 0, X0, 4, Z0 + 5, 1); S('winL', 0, X0 + 7, 4, Z0 + 5, 1);
+  S('door', 8, X0 + 2, 1, Z0 + 5);
+  S('p4x8', 4, X0, 16, Z0); S('p2x4', 4, X0, 16, Z0 + 4); S('p2x4', 4, X0 + 4, 16, Z0 + 4);
+  S('s4x2', 4, X0, 17, Z0 + 4); S('s4x2', 4, X0 + 4, 17, Z0 + 4);
+  S('s4x2', 4, X0 + 4, 17, Z0 + 2, 2); S('s4x2', 4, X0 + 8, 17, Z0 + 2, 2);
+  S('b2x4', 4, X0, 17, Z0 + 2); S('b2x4', 4, X0 + 4, 17, Z0 + 2);
+  S('r4x2', 4, X0, 20, Z0 + 2); S('r4x2', 4, X0 + 4, 20, Z0 + 2);
+  S('t2x2', 1, X0 + 3, 1, Z0 + 6); S('t2x2', 1, X0 + 3, 1, Z0 + 8);
+  S('tree', 9, X0 + 8, 1, Z0 + 7);
+  S('flower', 4, X0 - 3, 1, Z0 + 8); S('flower', 6, X0 - 2, 1, Z0 + 9); S('flower', 15, X0 - 3, 1, Z0 + 7);
+  S('lamp', 3, X0 - 2, 1, Z0 + 6);
+  S('b2x4', 9, 10, 0, -23); S('bigeye', 12, 10, 3, -22); S('b1x2', 9, 10, 3, -23); S('s2x2', 9, 12, 3, -23);
+  undoStack.length = 0;
+}
+
+/* =========================================================
+   INPUT + MAIN LOOP
+   ========================================================= */
+function readHand(h) {
+  h.ev = {};
+  const gp = h.src && h.src.gamepad; if (!gp) { h.trig = h.sq = 0; return; }
+  const b = gp.buttons;
+  h.trig = b[0] ? b[0].value : 0; h.sq = b[1] ? b[1].value : 0;
+  const tP = h.tOn, gP = h.gOn;
+  h.tOn = tP ? h.trig > 0.3 : h.trig > 0.6;
+  h.gOn = gP ? h.sq > 0.3 : h.sq > 0.6;
+  h.ev.tDown = h.tOn && !tP; h.ev.tUp = !h.tOn && tP; h.ev.gDown = h.gOn && !gP; h.ev.gUp = !h.gOn && gP;
+  h.bNow = [!!(b[3] && b[3].pressed), !!(b[4] && b[4].pressed), !!(b[5] && b[5].pressed)];
+  h.ev.b4 = h.bNow[1] && !h.bPrev[1]; h.ev.b5 = h.bNow[2] && !h.bPrev[2];
+  h.bPrev = h.bNow;
+}
+const clock = new THREE.Clock();
+function update(dt, now) {
+  for (const h of hands) readHand(h);
+  const L = hands.find(h => h.side === 'left' && h.src), Rh = hands.find(h => h.side === 'right' && h.src);
+  if (L && L.ev.b5) toggleMenu();
+
+  if (trans) updateTrans(dt);
+  else if (mode === 'big') updateBig(dt, L, Rh);
+  else updateSmall(dt, L, Rh);
+
+  if (Rh && Rh.src.gamepad && !trans) {
+    const gp = Rh.src.gamepad, rx = gp.axes.length >= 4 ? gp.axes[2] : 0, ry = gp.axes.length >= 4 ? gp.axes[3] : 0;
+    if (!turnLatch && Math.abs(rx) > 0.7 && Math.abs(rx) > Math.abs(ry)) { snapTurn(rx > 0 ? -Math.PI / 6 : Math.PI / 6); turnLatch = true; }
+    if (Math.abs(rx) < 0.3) turnLatch = false;
+  }
+  rig.updateMatrixWorld(true);
+
+  let hover = null;
+  for (const h of hands) {
+    if (!h.src) continue;
+    poseHand(h); trackHand(h, now);
+    if (!trans) {
+      if (h.posing) { updatePose(h); if ((h.posing.btn === 'trig' && h.ev.tUp) || (h.posing.btn === 'grip' && h.ev.gUp)) endPose(h); }
+      else if (h.selDrag) { if (h.ev.tUp) endSelDrag(h); }
+      else if (!h.held) { if (h.ev.tDown) tryGrab(h, 'trig'); else if (h.ev.gDown) tryGrab(h, 'grip'); }
+      else if ((h.holdBtn === 'trig' && h.ev.tUp) || (h.holdBtn === 'grip' && h.ev.gUp)) releaseHand(h);
+    }
+    if (h.held) { h.held.hand = h; updateGhost(h); }
+    const hv = pokeCheck(h); if (hv) hover = hv;
+    updateOutline(h);
+  }
+  if (menu.open && hover !== menu.hover) { menu.hover = hover; drawMenu(); }
+
+  updateThrown(dt);
+  updateDoors(dt);
+  updateSelection();
+  updateMyBody(dt);
+  updateNet(dt);
+  updateAvatars(dt);
+  if (menu.open && pageOf(menu.tab) === 'people') menu.figRoot.rotation.y = Math.sin(now * 0.8) * 0.5;
+  if (menu.msgT > 0) { menu.msgT -= dt; if (menu.msgT <= 0 && menu.open) drawMenu(); }
+  if (menu.bpArmT > 0) { menu.bpArmT -= dt; if (menu.bpArmT <= 0) { menu.bpArm = -1; if (menu.open) drawMenu(); } }
+  if (glueDirty) rebuildGlue();
+  updateBin(dt);
+
+  if (menu.open && mode === 'big') {
+    for (const m of menu.minis) {
+      m.spin += dt * 0.7;
+      let near = false;
+      for (const h of hands) if (h.grabObj && !h.held) { h.grabObj.getWorldPosition(_v1); m.g.getWorldPosition(_v2); if (_v1.distanceTo(_v2) < 0.05 * rig.scale.x) near = true; }
+      const tgt = m.g.userData.base * (near ? 1.25 : 1);
+      m.g.scale.setScalar(m.g.scale.x + (tgt - m.g.scale.x) * Math.min(1, dt * 12));
+      m.g.rotation.set(0.45, m.spin, 0);
+    }
+  }
+  if (menu.clearArm > 0) { menu.clearArm -= dt; if (menu.clearArm <= 0) { menu.clearArm = 0; if (menu.open) drawMenu(); } }
+
+  for (let i = poofs.length - 1; i >= 0; i--) {
+    const p = poofs[i]; p.userData.life -= dt; p.position.addScaledVector(p.userData.v, dt); p.userData.v.y -= 2 * dt;
+    p.material.opacity = Math.max(0, p.userData.life / 0.5); p.rotation.x += dt * 8;
+    if (p.userData.life <= 0) { scene.remove(p); p.material.dispose(); poofs.splice(i, 1); }
+  }
+
+  const hp = headWorld(_v3);
+  floor.position.x = Math.round(hp.x / TILE) * TILE; floor.position.z = Math.round(hp.z / TILE) * TILE;
+  const snapS = shadowHalf / 64;
+  sun.target.position.set(Math.round(hp.x / snapS) * snapS, Math.max(0, hp.y - shadowHalf * 0.4), Math.round(hp.z / snapS) * snapS);
+  sun.position.copy(sun.target.position).addScaledVector(SUN_DIR, shadowHalf * 3);
+
+  if (saveTimer > 0) { saveTimer -= dt; if (saveTimer <= 0) { saveNow(); if (menu.open) drawMenu(); } }
+}
+renderer.setAnimationLoop((time) => {
+  const dt = Math.min(0.05, clock.getDelta());
+  update(dt, time / 1000);
+  renderer.render(scene, camera);
+});
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+renderer.xr.addEventListener('sessionstart', () => { ac(); rig.position.set(0, 0, 0); rig.rotation.set(0, 0, 0); });
+
+/* boot */
+slot = parseInt(store.get('brickstudio_cur') || '1', 10) || 1;
+if (slot < 1 || slot > 5) slot = 1;
+loadSlot(slot);
+if (world.bricks.size === 0 && slot === 1 && !store.get('brickstudio_seeded')) { seedStarter(); store.set('brickstudio_seeded', '1'); saveNow(); }
+rebuildMinis();
+drawMenu();
+</script>
+</body>
+</html>
